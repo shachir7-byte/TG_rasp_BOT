@@ -3,7 +3,7 @@ import re
 import sqlite3
 import aiohttp
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -14,6 +14,9 @@ from aiogram.client.session.aiohttp import AiohttpSession
 BOT_TOKEN = "8671137490:AAH4Gssdr1OGCojx0_VXzCCTVIw8xlglgg0"
 PROXY_URL = None
 ADMIN_ID = 720293880
+
+# 🕐 ЧАСОВОЙ ПОЯС (Москва = UTC+3)
+MSK_TIMEZONE = timezone(timedelta(hours=3))
 
 # 📚 КОНФИГУРАЦИЯ ГРУПП
 GROUPS = {
@@ -72,7 +75,7 @@ def init_db():
 
 def save_user(chat_id: int, username: str = None, group: str = 'is'):
     conn = sqlite3.connect(DB_FILE)
-    now = datetime.now().isoformat()
+    now = datetime.now(MSK_TIMEZONE).isoformat()
     conn.execute("""
         INSERT OR IGNORE INTO users (chat_id, username, user_group, first_seen, request_count)
         VALUES (?, ?, ?, ?, 0)
@@ -96,7 +99,7 @@ def log_action(chat_id: int, action: str):
     conn.execute("""
         INSERT INTO stats (chat_id, action, timestamp)
         VALUES (?, ?, ?)
-    """, (chat_id, action, datetime.now().isoformat()))
+    """, (chat_id, action, datetime.now(MSK_TIMEZONE).isoformat()))
     conn.commit()
     conn.close()
 
@@ -275,7 +278,6 @@ async def fetch_schedule(group_key: str, target_date: str = None) -> list:
         print(f"API Error: {e}")
     return []
 
-# ✅ ИСПРАВЛЕНО: параметр data: list, цикл for item in data
 def parse_schedule_data(data: list, target_date: str = None) -> list:
     lessons = []
     for item in data:
@@ -308,7 +310,7 @@ def get_group_select_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_main_keyboard(chat_id: int = None):
-    today = datetime.now()
+    today = datetime.now(MSK_TIMEZONE)
     week_start = today - timedelta(days=today.weekday())
     
     buttons = []
@@ -522,7 +524,7 @@ async def handle_admin_panel(c: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("sch_") or c.data == "refresh_schedule")
 async def handle_schedule(c: types.CallbackQuery):
-    today = datetime.now()
+    today = datetime.now(MSK_TIMEZONE)
     action = c.data
     user_group = get_user_group(c.from_user.id)
     
@@ -692,7 +694,7 @@ async def notification_worker():
     print("✅ Worker запущен")
     while True:
         try:
-            now = datetime.now()
+            now = datetime.now(MSK_TIMEZONE)
             cur_time = now.strftime("%H:%M")
             today_str = now.strftime("%Y-%m-%d")
             
@@ -737,6 +739,7 @@ async def notification_worker():
 async def main():
     init_db()
     print("✅ Бот запущен...")
+    print(f"🕐 Часовой пояс: MSK (UTC+3)")
     print(f"📚 Группы:")
     for key, group in GROUPS.items():
         print(f"   {group['name']}: {group['group_id']}")
