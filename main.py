@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramBadRequest
 
 # ⚙️ НАСТРОЙКИ
 BOT_TOKEN = "8671137490:AAH4Gssdr1OGCojx0_VXzCCTVIw8xlglgg0"
@@ -404,13 +405,17 @@ async def handle_group_select(c: types.CallbackQuery):
     increment_request_count(c.from_user.id)
     log_action(c.from_user.id, f"group_select_{group_key}")
     
-    await c.message.edit_text(
-        f"✅ **Выбрана группа: {group_name}**\n\n"
-        f"📅 Дни недели\n📆 Неделя\n⏰ Уведомления\n\n"
-        f"Выбери день 👇",
-        reply_markup=get_main_keyboard(c.from_user.id),
-        parse_mode="Markdown"
-    )
+    try:
+        await c.message.edit_text(
+            f"✅ **Выбрана группа: {group_name}**\n\n"
+            f"📅 Дни недели\n📆 Неделя\n⏰ Уведомления\n\n"
+            f"Выбери день 👇",
+            reply_markup=get_main_keyboard(c.from_user.id),
+            parse_mode="Markdown"
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
     await c.answer()
 
 @dp.message(Command("menu"))
@@ -430,13 +435,17 @@ async def show_main_menu(message: types.Message):
     user_group = get_user_group(message.chat.id)
     group_name = GROUPS.get(user_group, {}).get('name', 'ИС-23/9-3')
     
-    await message.edit_text(
-        f"📚 **Группа: {group_name}**\n\n"
-        f"📅 Дни недели\n📆 Неделя\n⏰ Уведомления\n\n"
-        f"Выбери день 👇",
-        reply_markup=get_main_keyboard(message.chat.id),
-        parse_mode="Markdown"
-    )
+    try:
+        await message.edit_text(
+            f"📚 **Группа: {group_name}**\n\n"
+            f"📅 Дни недели\n📆 Неделя\n⏰ Уведомления\n\n"
+            f"Выбери день 👇",
+            reply_markup=get_main_keyboard(message.chat.id),
+            parse_mode="Markdown"
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
 
 @dp.message(Command("stats"))
 @dp.message(Command("clearstats"))
@@ -497,12 +506,16 @@ async def handle_main_menu(c: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "change_group")
 async def handle_change_group(c: types.CallbackQuery):
-    await c.message.edit_text(
-        "🔄 **Сменить группу**\n\n"
-        "Выберите вашу группу:",
-        reply_markup=get_group_select_keyboard(),
-        parse_mode="Markdown"
-    )
+    try:
+        await c.message.edit_text(
+            "🔄 **Сменить группу**\n\n"
+            "Выберите вашу группу:",
+            reply_markup=get_group_select_keyboard(),
+            parse_mode="Markdown"
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
     await c.answer()
 
 @dp.callback_query(lambda c: c.data == "admin_panel")
@@ -510,16 +523,20 @@ async def handle_admin_panel(c: types.CallbackQuery):
     if c.from_user.id != ADMIN_ID:
         return await c.answer("🔐 Доступ запрещён", show_alert=True)
     
-    await c.message.edit_text(
-        "👑 **Админ-панель**\n\n"
-        "**Команды:**\n"
-        "/stats — Статистика\n"
-        "/clearstats — Очистить\n"
-        "/notify 18:30 — Тест\n\n"
-        "Все действия логируются.",
-        parse_mode="Markdown", 
-        reply_markup=get_back_keyboard()
-    )
+    try:
+        await c.message.edit_text(
+            "👑 **Админ-панель**\n\n"
+            "**Команды:**\n"
+            "/stats — Статистика\n"
+            "/clearstats — Очистить\n"
+            "/notify 18:30 — Тест\n\n"
+            "Все действия логируются.",
+            parse_mode="Markdown", 
+            reply_markup=get_back_keyboard()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
     await c.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("sch_") or c.data == "refresh_schedule")
@@ -558,11 +575,15 @@ async def handle_schedule(c: types.CallbackQuery):
     lessons = await fetch_schedule(user_group, target_date)
     text = format_schedule(title, lessons, is_week=is_week)
     
-    await c.message.edit_text(
-        text, 
-        parse_mode="Markdown", 
-        reply_markup=get_schedule_keyboard()
-    )
+    try:
+        await c.message.edit_text(
+            text, 
+            parse_mode="Markdown", 
+            reply_markup=get_schedule_keyboard()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
     
     await c.answer()
 
@@ -581,54 +602,74 @@ async def notify_menu(c: types.CallbackQuery):
     else:
         status = "🔕 Отключено"
     
-    await c.message.edit_text(
-        f"⏰ **Уведомления**\n\n"
-        f"{status}\n\n"
-        f"Выберите тип уведомлений:",
-        parse_mode="Markdown", 
-        reply_markup=get_notify_main_menu()
-    )
+    try:
+        await c.message.edit_text(
+            f"⏰ **Уведомления**\n\n"
+            f"{status}\n\n"
+            f"Выберите тип уведомлений:",
+            parse_mode="Markdown", 
+            reply_markup=get_notify_main_menu()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
     await c.answer()
 
 @dp.callback_query(lambda c: c.data == "notify_type_time")
 async def notify_type_time(c: types.CallbackQuery):
-    await c.message.edit_text(
-        "⏰ **По времени**\n\n"
-        "Выберите время или введите свое:",
-        parse_mode="Markdown", 
-        reply_markup=get_notify_time_keyboard()
-    )
+    try:
+        await c.message.edit_text(
+            "⏰ **По времени**\n\n"
+            "Выберите время или введите свое:",
+            parse_mode="Markdown", 
+            reply_markup=get_notify_time_keyboard()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
     await c.answer()
 
 @dp.callback_query(lambda c: c.data == "notify_type_offset")
 async def notify_type_offset(c: types.CallbackQuery):
-    await c.message.edit_text(
-        "⏳ **За время до пары**\n\n"
-        "Расписание придет за выбранное время до первой пары:",
-        parse_mode="Markdown", 
-        reply_markup=get_notify_offset_keyboard()
-    )
+    try:
+        await c.message.edit_text(
+            "⏳ **За время до пары**\n\n"
+            "Расписание придет за выбранное время до первой пары:",
+            parse_mode="Markdown", 
+            reply_markup=get_notify_offset_keyboard()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
     await c.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("notify_time_"))
 async def notify_time_set(c: types.CallbackQuery):
     time_val = c.data.replace("notify_time_", "")
     if time_val == "custom":
-        await c.message.edit_text(
-            "✏️ **Свое время**\n"
-            "Напиши время: `18:30`\n"
-            "Или 🏠 назад",
-            parse_mode="Markdown", 
-            reply_markup=get_back_keyboard()
-        )
+        try:
+            await c.message.edit_text(
+                "✏️ **Свое время**\n"
+                "Напиши время: `18:30`\n"
+                "Или 🏠 назад",
+                parse_mode="Markdown", 
+                reply_markup=get_back_keyboard()
+            )
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e):
+                raise
     else:
         save_notify(c.from_user.id, time_val, 'time', 0)
         log_action(c.from_user.id, f"notify_time_{time_val}")
-        await c.message.edit_text(
-            f"✅ **Настроено!**\n🕐 {time_val}",
-            parse_mode="Markdown",
-            reply_markup=get_notify_main_menu()
-        )
+        try:
+            await c.message.edit_text(
+                f"✅ **Настроено!**\n🕐 {time_val}",
+                parse_mode="Markdown",
+                reply_markup=get_notify_main_menu()
+            )
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e):
+                raise
     await c.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("notify_offset_"))
@@ -636,41 +677,53 @@ async def notify_offset_set(c: types.CallbackQuery):
     offset = int(c.data.replace("notify_offset_", ""))
     save_notify(c.from_user.id, None, 'offset', offset)
     log_action(c.from_user.id, f"notify_offset_{offset}")
-    await c.message.edit_text(
-        f"✅ **Настроено!**\n⏳ За {offset} ч до пары",
-        parse_mode="Markdown",
-        reply_markup=get_notify_main_menu()
-    )
+    try:
+        await c.message.edit_text(
+            f"✅ **Настроено!**\n⏳ За {offset} ч до пары",
+            parse_mode="Markdown",
+            reply_markup=get_notify_main_menu()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
     await c.answer()
 
 @dp.callback_query(lambda c: c.data == "notify_delete")
 async def notify_delete(c: types.CallbackQuery):
     cancel_notify(c.from_user.id)
     log_action(c.from_user.id, "notify_delete")
-    await c.message.edit_text(
-        "🗑 **Уведомления отключены**",
-        parse_mode="Markdown", 
-        reply_markup=get_notify_main_menu()
-    )
+    try:
+        await c.message.edit_text(
+            "🗑 **Уведомления отключены**",
+            parse_mode="Markdown", 
+            reply_markup=get_notify_main_menu()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
     await c.answer()
 
 @dp.callback_query(lambda c: c.data == "help")
 async def handle_help(c: types.CallbackQuery):
-    await c.message.edit_text(
-        "ℹ️ **Помощь**\n\n"
-        "**Команды:**\n"
-        "/start — Меню\n"
-        "/notify 18:30 — Уведомление\n"
-        "/cancel_notify — Отключить\n"
-        "/stats — Статистика (админ)\n\n"
-        "**Кнопки:**\n"
-        "📅 Пн-Сб — день\n"
-        "📆 Неделя — всё\n"
-        "⏰ Уведы — настройки\n"
-        "🔄 Сменить группу",
-        parse_mode="Markdown", 
-        reply_markup=get_back_keyboard()
-    )
+    try:
+        await c.message.edit_text(
+            "ℹ️ **Помощь**\n\n"
+            "**Команды:**\n"
+            "/start — Меню\n"
+            "/notify 18:30 — Уведомление\n"
+            "/cancel_notify — Отключить\n"
+            "/stats — Статистика (админ)\n\n"
+            "**Кнопки:**\n"
+            "📅 Пн-Сб — день\n"
+            "📆 Неделя — всё\n"
+            "⏰ Уведы — настройки\n"
+            "🔄 Сменить группу",
+            parse_mode="Markdown", 
+            reply_markup=get_back_keyboard()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
     await c.answer()
 
 # ⏰ WORKER
