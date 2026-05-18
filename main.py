@@ -772,15 +772,17 @@ async def run_bot():
 
     await bot.send_message(ADMIN_ID, f"🤖 <b>БОТ ЗАПУЩЕН (PRO v2)</b>\n🕒 {datetime.now(LOCAL_TIMEZONE).strftime('%H:%M')}\n👥 Пользователей: {await get_user_count()}", parse_mode="HTML")
     
+    # Уведомляем всех пользователей о запуске бота
     all_users = await get_all_users_chat_ids()
     success_count = 0
-    print("📢 Уведомление о перезапуске...")
+    print("📢 Уведомление пользователей о запуске бота...")
     for uid in all_users:
         if uid == ADMIN_ID: continue
         try:
-            await bot.send_message(uid, "✅ <b>Бот обновлен!</b>\nРаботает быстрее (Single DB Conn + FSM).", parse_mode="HTML")
+            await bot.send_message(uid, "🤖 <b>БОТ ЗАПУЩЕН</b>\n\nДЛЯ ПРОСМОТРА РАСПИСАНИЯ НАЖМИТЕ /start", parse_mode="HTML")
             success_count += 1
-        except: pass
+        except Exception as e:
+            logger.warning(f"Не удалось отправить уведомление пользователю {uid}: {e}")
         await asyncio.sleep(0.05)
     
     if success_count > 0:
