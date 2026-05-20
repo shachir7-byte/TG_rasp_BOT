@@ -1,18 +1,45 @@
-2026-04-27 22:35:00,687 - INFO - База данных инициализирована (Единое соединение)
-2026-04-27 22:35:01,460 - INFO - Webhook сброшен
-2026-04-27 22:35:01,613 - INFO - Worker запущен
-2026-04-27 23:57:32,759 - INFO - Бот полностью остановлен.
-2026-05-03 23:28:39,559 - INFO - База данных инициализирована (Единое соединение)
-2026-05-03 23:28:40,648 - INFO - Webhook сброшен
-2026-05-03 23:28:40,801 - INFO - Worker запущен
-2026-05-04 00:01:11,275 - INFO - Логи очищены
-2026-05-04 00:01:41,283 - INFO - Логи очищены
-2026-05-04 13:52:00,859 - INFO - Бот полностью остановлен.
-2026-05-10 23:43:00,244 - INFO - База данных инициализирована (Единое соединение)
-2026-05-10 23:43:01,260 - INFO - Webhook сброшен
-2026-05-10 23:43:01,437 - INFO - Worker запущен
-2026-05-11 00:01:01,833 - INFO - Логи очищены
-2026-05-11 00:01:31,830 - INFO - Логи очищены
-2026-05-18 15:41:02,032 - INFO - База данных инициализирована (Единое соединение)
-2026-05-18 15:41:03,342 - INFO - Webhook сброшен
-2026-05-18 15:41:03,568 - INFO - Worker запущен
+
+2026-05-19 23:05:39,545 - INFO - База данных подключена
+2026-05-19 23:05:40,796 - INFO - Webhook сброшен
+2026-05-19 23:05:41,033 - INFO - Начало рассылки уведомления о запуске (3 пользователей)...
+2026-05-19 23:05:41,666 - INFO - Рассылка завершена. Успешно: 2, Ошибок: 0
+2026-05-19 23:05:41,666 - INFO - Worker запущен
+2026-05-20 00:01:12,775 - INFO - Логи статистики очищены
+2026-05-20 00:01:42,784 - INFO - Логи статистики очищены
+2026-05-20 01:03:12,644 - INFO - База данных готова
+2026-05-20 01:03:13,925 - INFO - Webhook сброшен
+2026-05-20 01:03:14,094 - INFO - Начало рассылки уведомления о запуске (3 пользователей)...
+2026-05-20 01:03:14,587 - INFO - Рассылка завершена. Успешно: 2, Ошибок: 0
+2026-05-20 01:03:14,587 - INFO - Worker запущен
+2026-05-20 02:12:44,303 - WARNING - Сеть недоступна при команде /start
+2026-05-20 02:12:57,182 - INFO - Соединения закрыты. Перезапуск через 5 секунд...
+2026-05-20 02:13:07,267 - INFO - База данных готова
+2026-05-20 02:13:08,013 - INFO - Webhook сброшен
+2026-05-20 02:13:08,155 - INFO - Начало рассылки уведомления о запуске (3 пользователей)...
+2026-05-20 02:13:08,570 - INFO - Рассылка завершена. Успешно: 2, Ошибок: 0
+2026-05-20 02:13:08,570 - INFO - Worker запущен
+2026-05-20 12:12:08,979 - ERROR - Ошибка в handle_group_select: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [None]
+2026-05-20 12:12:11,351 - ERROR - Ошибка в handle_group_select: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [None]
+2026-05-20 12:12:13,457 - WARNING - Сеть недоступна при команде /start
+2026-05-20 12:12:20,347 - WARNING - Сеть недоступна при команде /start
+2026-05-20 12:12:37,434 - ERROR - Ошибка в handle_group_select: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [None]
+2026-05-20 12:12:40,259 - WARNING - Сеть недоступна при команде /start
+2026-05-20 12:12:59,629 - ERROR - Ошибка в handle_group_select: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [None]
+2026-05-20 12:13:23,577 - WARNING - Сеть недоступна при команде /start
+2026-05-20 12:14:13,945 - WARNING - Сеть недоступна при команде /start
+2026-05-20 12:14:41,002 - WARNING - Сеть недоступна при команде /start
+2026-05-20 12:14:42,058 - ERROR - Ошибка в handle_group_select: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [None]
+2026-05-20 12:14:42,626 - ERROR - Ошибка в handle_group_select: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [None]
+2026-05-20 12:14:48,010 - ERROR - Ошибка в handle_group_select: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [None]
+2026-05-20 12:17:55,741 - ERROR - Ошибка в handle_group_select: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [None]
+2026-05-20 12:17:56,650 - WARNING - Сеть недоступна при команде /start
+2026-05-20 12:18:01,159 - ERROR - Ошибка в handle_group_select: HTTP Client says - ClientConnectorError: Cannot connect to host api.telegram.org:443 ssl:default [None]
+2026-05-20 12:24:27,977 - WARNING - Сеть недоступна при команде /start
+2026-05-20 13:26:38,708 - WARNING - Сеть недоступна при команде /start
+2026-05-20 13:28:50,428 - WARNING - Сеть недоступна при команде /start
+2026-05-20 14:44:20,774 - WARNING - Сеть недоступна при команде /start
+2026-05-20 18:01:05,305 - INFO - Соединения закрыты. Перезапуск через 5 секунд...
+2026-05-20 23:09:59,844 - INFO - --- ЗАПУСК БОТА (STABLE VERSION) ---
+2026-05-20 23:09:59,849 - INFO - База данных готова
+2026-05-20 23:10:00,748 - INFO - Webhook сброшен
+2026-05-20 23:10:01,324 - INFO - Worker запущен
