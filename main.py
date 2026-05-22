@@ -440,16 +440,19 @@ def get_admin_keyboard():
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ])
 
-# 🛡 ОБРАБОТЧИК ОШИБОК (ИСПРАВЛЕНО)
-async def errors_handler(event: types.Update, exception: Exception):
+# 🛡 ОБРАБОТЧИК ОШИБОК (ИСПРАВЛЕНО ПОД AIOMGRAM 3.X)
+from aiogram.types import ErrorEvent
+
+async def errors_handler(event: ErrorEvent):
+    exception = event.exception
+    
     if isinstance(exception, TelegramConflictError):
         logger.warning("Конфликт версий бота! Проверьте, не запущен ли бот в другом месте.")
-        return True # Игнорируем, чтобы не спамить
+        return True
     if isinstance(exception, TelegramNetworkError):
         logger.warning(f"Проблемы с интернетом: {exception}")
         return True
     if isinstance(exception, TelegramBadRequest):
-        # Ошибки редактирования сообщений (например, сообщение не изменено) игнорируем
         if "message is not modified" in str(exception):
             return True
         logger.warning(f"Bad Request: {exception}")
