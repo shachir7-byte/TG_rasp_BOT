@@ -4,9 +4,11 @@ import logging
 import platform
 import os
 import signal
+import time
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from logging.handlers import RotatingFileHandler
+from typing import Optional, Dict, Any
 
 # 🔐 Загрузка переменных окружения
 from dotenv import load_dotenv
@@ -18,8 +20,11 @@ import aiosqlite
 # 🌐 HTTP Сессия
 import aiohttp
 
+# 🖥 Системные метрики
+import psutil
+
 # 🤖 Aiogram
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -63,6 +68,52 @@ dp = Dispatcher()
 DB_FILE = "schedule.db"
 GLOBAL_SESSION = None
 
+# --- КЭШИРОВАНИЕ ---
+SCHEDULE_CACHE: Dict[str, Dict[str, Any]] = {}
+CACHE_TTL = 1800  # 30 минут в секундах
+
+def get_cache_key(group_key: str, target_date: str) -> str:
+    return f"{group_key}:{target_date or 'today'}"
+
+def is_cache_valid(cache_entry: Dict[str, Any]) -> bool:
+    if not cache_entry:
+        return False
+    return (time.time() - cache_entry.get('timestamp', 0)) < CACHE_TTL
+
+async def get_cached_schedule(group_key: str, target_date: str) -> Optional[list]:
+    key = get_cache_key(group_key, target_date)
+    if key in SCHEDULE_CACHE:
+        if is_cache_valid(SCHEDULE_CACHE[key]):
+            logger.debug(f"Кэш попадание для {key}")
+            return SCHEDULE_CACHE[key]['data']
+        else:
+            del SCHEDULE_CACHE[key]
+    return None
+
+async def cache_schedule(group_key: str, target_date: str, data: list):
+    key = get_cache_key(group_key, target_date)
+    SCHEDULE_CACHE[key] = {'data': data, 'timestamp': time.time()}
+    logger.debug(f"Кэшировано {key}, размер кэша: {len(SCHEDULE_CACHE)}")
+
+# --- THROTTLING MIDDLWARE ---
+class ThrottlingMiddleware(BaseMiddleware):
+    def __init__(self, delay: float = 0.05):
+        self.delay = delay
+        self.last_request: Dict[int, float] = {}
+    
+    async def __call__(self, handler, event: types.Update, data: dict):
+        user_id = event.event.from_user.id if hasattr(event, 'event') and hasattr(event.event, 'from_user') else None
+        if user_id:
+            now = time.time()
+            if user_id in self.last_request:
+                elapsed = now - self.last_request[user_id]
+                if elapsed < self.delay:
+                    await asyncio.sleep(self.delay - elapsed)
+            self.last_request[user_id] = now
+        return await handler(event, data)
+
+dp.update.middleware(ThrottlingMiddleware(delay=0.05))
+
 # --- СОСТОЯНИЯ (FSM) ---
 class AdminStates(StatesGroup):
     broadcast_wait = State()
@@ -77,6 +128,9 @@ async def init_db():
             chat_id INTEGER PRIMARY KEY, username TEXT, user_group TEXT DEFAULT 'is',
             notify_time TEXT, notify_type TEXT DEFAULT 'time', notify_offset INTEGER DEFAULT 0,
             request_count INTEGER DEFAULT 0, last_sent_date TEXT, first_seen TEXT)""")
+        # Добавляем индекс на user_group для ускорения поиска по группам
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_user_group ON users(user_group)")
+        
         await db.execute("""CREATE TABLE IF NOT EXISTS stats (
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, action TEXT, timestamp TEXT)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS groups_config (
@@ -88,7 +142,7 @@ async def init_db():
         ]
         await db.executemany("INSERT OR IGNORE INTO groups_config (key, name, group_id) VALUES (?, ?, ?)", default_groups)
         await db.commit()
-    logger.info("База данных готова")
+    logger.info("База данных готова с индексами")
 
 # Хелперы БД
 async def save_user(chat_id: int, username: str = None, group: str = 'is'):
@@ -245,6 +299,11 @@ async def get_week_id_by_date(date_str: str) -> str:
     return None
 
 async def fetch_schedule(group_key: str, target_date: str = None) -> list:
+    # 1. Проверяем кэш
+    cached = await get_cached_schedule(group_key, target_date)
+    if cached is not None:
+        return cached
+    
     groups = await get_groups_config()
     group_config = groups.get(group_key, groups.get('is'))
     group_id = group_config['group_id']
@@ -254,7 +313,8 @@ async def fetch_schedule(group_key: str, target_date: str = None) -> list:
         req_date = next_monday.strftime("%Y-%m-%d")
 
     week_id = await get_week_id_by_date(req_date)
-    if not week_id: return []
+    if not week_id: 
+        return []
 
     url = f"https://sielom.ru/schedule/api/lessons/group/{group_id}"
     params = {"week_id": week_id}
@@ -268,7 +328,10 @@ async def fetch_schedule(group_key: str, target_date: str = None) -> list:
                 elif isinstance(data, dict): lessons_data = data.get('data', data.get('items', []))
                 if target_date:
                     lessons_data = [l for l in lessons_data if isinstance(l, dict) and l.get('date') == target_date]
-                return parse_schedule_data(lessons_data, target_date)
+                result = parse_schedule_data(lessons_data, target_date)
+                # 2. Сохраняем в кэш
+                await cache_schedule(group_key, target_date, result)
+                return result
     except Exception as e:
         logger.error(f"Ошибка API: {e}")
     return []
@@ -311,11 +374,15 @@ def get_main_keyboard(chat_id: int = None):
         week_start = today - timedelta(days=today.weekday())
     buttons = []
     row1, row2 = [], []
-    DAYS_SHORT = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+    DAYS_SHORT = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб']
     for i in range(6):
         day_date = week_start + timedelta(days=i)
-        is_today = " •" if (today.weekday() != 6 and i == today.weekday()) else ""
-        btn = InlineKeyboardButton(text=f"{DAYS_SHORT[i]}{is_today}", callback_data=f"sch_day_{day_date.strftime('%Y-%m-%d')}")
+        # Динамический маркер для текущего дня
+        if today.weekday() != 6 and i == today.weekday():
+            btn_text = f"• {DAYS_SHORT[i]} •"
+        else:
+            btn_text = DAYS_SHORT[i]
+        btn = InlineKeyboardButton(text=btn_text, callback_data=f"sch_day_{day_date.strftime('%Y-%m-%d')}")
         if i < 3: row1.append(btn)
         else: row2.append(btn)
     buttons.extend([row1, row2])
@@ -373,16 +440,19 @@ def get_admin_keyboard():
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ])
 
-# 🛡 ОБРАБОТЧИК ОШИБОК (ИСПРАВЛЕНО)
-async def errors_handler(event: types.Update, exception: Exception):
+# 🛡 ОБРАБОТЧИК ОШИБОК (ИСПРАВЛЕНО ПОД AIOMGRAM 3.X)
+from aiogram.types import ErrorEvent
+
+async def errors_handler(event: ErrorEvent):
+    exception = event.exception
+    
     if isinstance(exception, TelegramConflictError):
         logger.warning("Конфликт версий бота! Проверьте, не запущен ли бот в другом месте.")
-        return True # Игнорируем, чтобы не спамить
+        return True
     if isinstance(exception, TelegramNetworkError):
         logger.warning(f"Проблемы с интернетом: {exception}")
         return True
     if isinstance(exception, TelegramBadRequest):
-        # Ошибки редактирования сообщений (например, сообщение не изменено) игнорируем
         if "message is not modified" in str(exception):
             return True
         logger.warning(f"Bad Request: {exception}")
@@ -469,14 +539,49 @@ async def handle_admin_test(c: types.CallbackQuery):
     await c.answer("🧪 Диагностика...", show_alert=False)
     await log_action(c.from_user.id, "run_test")
     report = ["🧪 <b>Отчет</b>\n"]
+    
+    # БД
     try:
         count = await get_user_count()
         report.append(f"✅ <b>БД:</b> OK ({count} юзеров)")
-    except Exception as e: report.append(f"❌ <b>БД:</b> {e}")
+    except Exception as e: 
+        report.append(f"❌ <b>БД:</b> {e}")
+    
+    # API
     try:
+        start_time = time.time()
         lessons = await fetch_schedule('is', datetime.now(LOCAL_TIMEZONE).strftime("%Y-%m-%d"))
-        report.append(f"✅ <b>API:</b> OK ({len(lessons)} пар)")
-    except Exception as e: report.append(f"❌ <b>API:</b> {e}")
+        api_time = (time.time() - start_time) * 1000
+        cache_status = "(кэш)" if len(SCHEDULE_CACHE) > 0 else "(API)"
+        report.append(f"✅ <b>API:</b> OK ({len(lessons)} пар) {cache_status} [{api_time:.0f}мс]")
+    except Exception as e: 
+        report.append(f"❌ <b>API:</b> {e}")
+    
+    # Системные метрики (psutil)
+    try:
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        ram = psutil.virtual_memory()
+        ram_percent = ram.percent
+        disk = psutil.disk_usage('/')
+        disk_free_gb = disk.free / (1024**3)
+        report.append(f"\n💻 <b>Система:</b>")
+        report.append(f"   CPU: {cpu_percent}% | RAM: {ram_percent}%")
+        report.append(f"   Диск свободно: {disk_free_gb:.1f} ГБ")
+    except Exception as e:
+        report.append(f"❌ <b>Система:</b> {e}")
+    
+    # Пинг до API
+    try:
+        start_ping = time.time()
+        async with GLOBAL_SESSION.get("https://sielom.ru/schedule/api/weeks/date/2024-01-01", timeout=5) as resp:
+            ping_ms = (time.time() - start_ping) * 1000
+            report.append(f"🌐 <b>Пинг sielom.ru:</b> {ping_ms:.0f}мс")
+    except Exception as e:
+        report.append(f"❌ <b>Пинг:</b> {e}")
+    
+    # Размер кэша
+    report.append(f"\n🗄 <b>Кэш:</b> {len(SCHEDULE_CACHE)} записей")
+    
     report.append("\n✅ <b>Готов к работе.</b>")
     await c.message.answer("\n".join(report), parse_mode="HTML", reply_markup=get_admin_keyboard())
 
