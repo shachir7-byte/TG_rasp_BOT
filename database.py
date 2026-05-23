@@ -5,14 +5,12 @@ from config import LOCAL_TIMEZONE_OFFSET, DEFAULT_GROUP, GROUPS_CONFIG
 DB_FILE = "schedule.db"
 TZ = timezone(timedelta(hours=LOCAL_TIMEZONE_OFFSET))
 
-# Глобальное соединение
 _db_connection: aiosqlite.Connection = None
 
 async def get_db_connection() -> aiosqlite.Connection:
     global _db_connection
     if _db_connection is None:
         _db_connection = await aiosqlite.connect(DB_FILE)
-        # Включаем WAL режим для лучшей производительности
         await _db_connection.execute("PRAGMA journal_mode=WAL")
     return _db_connection
 
@@ -25,7 +23,6 @@ async def close_db_connection():
 async def init_db():
     db = await get_db_connection()
     
-    # Таблица пользователей
     await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             chat_id INTEGER PRIMARY KEY,
@@ -41,7 +38,6 @@ async def init_db():
         )
     """)
     
-    # Таблица статистики
     await db.execute("""
         CREATE TABLE IF NOT EXISTS stats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,7 +47,6 @@ async def init_db():
         )
     """)
     
-    # Таблица конфигурации групп
     await db.execute("""
         CREATE TABLE IF NOT EXISTS groups_config (
             key TEXT PRIMARY KEY,
@@ -60,11 +55,9 @@ async def init_db():
         )
     """)
 
-    # Индексы
     await db.execute("CREATE INDEX IF NOT EXISTS idx_user_group ON users(user_group)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_stats_chat ON stats(chat_id)")
 
-    # Заполнение групп
     for key, data in GROUPS_CONFIG.items():
         await db.execute(
             "INSERT OR IGNORE INTO groups_config (key, name, group_id) VALUES (?, ?, ?)",
@@ -72,8 +65,6 @@ async def init_db():
         )
     
     await db.commit()
-
-# --- Хелперы ---
 
 async def save_user(chat_id: int, username: str = None, group: str = DEFAULT_GROUP):
     db = await get_db_connection()
@@ -138,6 +129,12 @@ async def get_all_users():
     db = await get_db_connection()
     async with db.execute("SELECT chat_id, username, user_group FROM users") as cursor:
         return await cursor.fetchall()
+
+async def get_all_users_chat_ids():
+    db = await get_db_connection()
+    async with db.execute("SELECT chat_id FROM users") as cursor:
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
 
 async def get_user_count() -> int:
     db = await get_db_connection()
