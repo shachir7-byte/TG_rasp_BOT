@@ -5,9 +5,10 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID")) if os.getenv("ADMIN_ID") else 0
+PROXY_URL = os.getenv("PROXY_URL")
 
 LOCAL_TIMEZONE_OFFSET = 5
-DEFAULT_GROUP = "is"  # <-- ЭТОГО НЕ ХВАТАЛО РАНЬШЕ
+DEFAULT_GROUP = "is"
 CACHE_TTL_SECONDS = 1800
 
 GROUPS_CONFIG = {

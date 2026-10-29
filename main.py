@@ -1,14 +1,14 @@
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramConflictError, TelegramNetworkError
-from config import BOT_TOKEN, ADMIN_ID
+from config import BOT_TOKEN, ADMIN_ID, PROXY_URL
 from database import init_db, close_db_connection, get_all_users, get_user_settings
 from utils.api_client import init_session, close_session
 from middlewares.throttling import ThrottlingMiddleware
-from handlers import admin, schedule, worker # ВАЖНО: admin перед schedule
+from handlers import admin, schedule, worker
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +26,10 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-logging.getLogger("aiogram").setLevel(logging.WARNING) 
+logging.getLogger("aiogram").setLevel(logging.WARNING)
 logging.getLogger("aiogram").addHandler(file_handler)
 
 dp = Dispatcher()
-# Порядок важен: admin первым, чтобы перехватывать состояния FSM
 dp.include_router(admin.router)
 dp.include_router(schedule.router)
 dp.update.middleware(ThrottlingMiddleware(delay=0.05))
@@ -42,12 +41,16 @@ async def on_startup(bot: Bot):
         await init_session()
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook сброшен, БД и сессии готовы")
-        
+
         try:
-            await bot.send_message(ADMIN_ID, f"🤖 <b>БОТ ЗАПУЩЕН</b>\nЛоги пишутся в bot.log", parse_mode="HTML")
+            await bot.send_message(
+                ADMIN_ID, 
+                f"🤖 <b>БОТ ЗАПУЩЕН</b>\n\nНажмите /start для начала работы.\nЛоги пишутся в bot.log", 
+                parse_mode="HTML"
+            )
         except Exception as e:
             logger.warning(f"Не удалось уведомить админа: {e}")
-        
+
         users = await get_all_users()
         count = 0
         for u in users:
@@ -61,13 +64,13 @@ async def on_startup(bot: Bot):
             except Exception:
                 pass
             await asyncio.sleep(0.05)
-        
+
         if count > 0:
-            logger.info(f"Restart notified to {count} users")
-        
+            logger.info(f"Уведомлено о перезапуске {count} пользователям")
+
         asyncio.create_task(worker.notification_worker(bot))
-        logger.info("Worker task created")
-        
+        logger.info("Задача worker запущена")
+
     except Exception as e:
         logger.critical(f"Ошибка при старте: {e}")
         raise
@@ -79,15 +82,20 @@ async def on_shutdown(bot: Bot):
         await close_db_connection()
     except Exception as e:
         logger.error(f"Ошибка закрытия сессий: {e}")
-    logger.info("Sessions closed gracefully")
+    logger.info("Сессии закрыты")
+
+dp.startup.register(on_startup)
+dp.shutdown.register(on_shutdown)
 
 async def main():
-    session = AiohttpSession()
+    if PROXY_URL:
+        logger.info(f"Используем прокси: {PROXY_URL}")
+        session = AiohttpSession(proxy=PROXY_URL)
+    else:
+        session = AiohttpSession()
+
     bot = Bot(token=BOT_TOKEN, session=session)
-    
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-    
+
     try:
         logger.info("Запуск polling...")
         print("🚀 Бот запущен! (Логи в bot.log)")
@@ -95,13 +103,14 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Остановка по Ctrl+C")
     except TelegramConflictError:
-        logger.error("❌ КОНФЛИКТ: Бот уже запущен!")
+        logger.error("❌ Конфликт: бот уже запущен")
     except TelegramNetworkError as e:
-        logger.error(f"❌ СЕТЬ: {e}")
+        logger.error(f"❌ Сеть: {e}")
     except Exception as e:
         logger.critical(f"Критическая ошибка: {e}")
     finally:
         try:
+            await bot.session.close()
             await bot.close()
         except Exception as e:
             logger.error(f"Ошибка при закрытии бота: {e}")

@@ -1,13 +1,14 @@
 import logging
 import psutil
 import asyncio
+import time
 from aiogram import Router, F, types
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from config import ADMIN_ID
 from database import (
-    get_full_admin_stats, clear_stats, get_user_count, 
+    get_full_admin_stats, clear_stats, get_user_count,
     get_all_users_chat_ids, log_action
 )
 from utils.api_client import get_schedule, GLOBAL_SESSION
@@ -52,44 +53,68 @@ async def admin_stats(c: types.CallbackQuery):
 async def admin_test(c: types.CallbackQuery):
     if c.from_user.id != ADMIN_ID: return
     await c.answer("🧪 Диагностика...", show_alert=False)
-    report = ["🧪 <b>Отчет</b>\n"]
+    
+    report = []
+    report.append("🧪 <b>System Diagnostic Report</b>")
+    report.append("──────────────────────────")
 
-    # БД
+    # 1. База данных
     try:
         count = await get_user_count()
-        report.append(f"✅ <b>БД:</b> OK ({count} юзеров)")
+        report.append(f"🗄 <b>База данных:</b> 🟢 OK")
+        report.append(f"👥 <b>Пользователей:</b> <code>{count}</code>")
     except Exception as e:
-        report.append(f"❌ <b>БД:</b> {e}")
+        report.append(f"🗄 <b>База данных:</b> 🔴 ERROR")
+        report.append(f"   └ <code>{e}</code>")
 
-    # API
+    # 2. API и Кэш
     try:
-        start_time = datetime.now().timestamp()
+        start_time = time.time()
         data, changes = await get_schedule('is', datetime.now(TZ).strftime("%Y-%m-%d"))
-        api_time = (datetime.now().timestamp() - start_time) * 1000
+        api_time = (time.time() - start_time) * 1000
         cache_status = "(кэш)" if not changes else "(обновлено)"
-        report.append(f"✅ <b>API:</b> OK ({len(data)} пар) {cache_status} [{api_time:.0f}мс]")
+        status_icon = "🟢" if len(data) > 0 else "🟡"
+        
+        report.append(f"🌐 <b>API sielom.ru:</b> {status_icon} OK")
+        report.append(f"   └ Пар: <code>{len(data)}</code> {cache_status}")
+        report.append(f"   └ Response: <code>{api_time:.0f}мс</code>")
     except Exception as e:
-        report.append(f"❌ <b>API:</b> {e}")
+        report.append(f"🌐 <b>API sielom.ru:</b> 🔴 ERROR")
+        report.append(f"   └ <code>{e}</code>")
 
-    # Система
+    # 3. Система (Ресурсы ПК)
     try:
         process = psutil.Process()
         mem_mb = process.memory_info().rss / 1024 / 1024
         cpu_percent = psutil.cpu_percent(interval=0.1)
-        report.append(f"💻 <b>CPU:</b> {cpu_percent}% | <b>RAM:</b> {mem_mb:.1f} MB")
+        
+        report.append("")
+        report.append("💻 <b>Хост (Твой ПК):</b>")
+        report.append(f"   ├ CPU Load: <code>{cpu_percent}%</code>")
+        report.append(f"   └ RAM Usage: <code>{mem_mb:.1f} MB</code>")
     except Exception as e:
-        report.append(f"❌ <b>Система:</b> {e}")
+        report.append(f"💻 <b>Система:</b> 🔴 ERROR ({e})")
 
-    # Пинг
+    # 4. Пинг (С проверкой сессии)
+    report.append("")
+    report.append("🛰 <b>Network:</b>")
     try:
-        start_ping = datetime.now().timestamp()
-        async with GLOBAL_SESSION.get("https://sielom.ru", timeout=5) as resp:
-            ping_ms = (datetime.now().timestamp() - start_ping) * 1000
-            report.append(f"🌐 <b>Пинг sielom.ru:</b> {ping_ms:.0f}мс")
+        if GLOBAL_SESSION is None:
+            report.append("   └ Ping API: <code>Сессия не инициализирована</code>")
+        else:
+            start_ping = time.time()
+            # Пингуем главную или эндпоинт недель
+            async with GLOBAL_SESSION.get("https://sielom.ru/schedule/api/weeks", timeout=5) as resp:
+                ping_ms = (time.time() - start_ping) * 1000
+                report.append(f"   └ Ping API: <code>{ping_ms:.0f}мс</code>")
     except Exception as e:
-        report.append(f"❌ <b>Пинг:</b> {e}")
+        report.append(f"   └ Ping API: 🔴 <code>{e}</code>")
 
-    await c.message.answer("\n".join(report), parse_mode="HTML", reply_markup=get_admin_kb())
+    report.append("")
+    report.append("✅ <b>Статус:</b> Бот готов к работе")
+
+    final_text = "\n".join(report)
+    await c.message.answer(final_text, parse_mode="HTML", reply_markup=get_admin_kb())
 
 @router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast(c: types.CallbackQuery, state: FSMContext):
@@ -111,9 +136,9 @@ async def admin_broadcast(c: types.CallbackQuery, state: FSMContext):
 async def process_broadcast(m: types.Message, state: FSMContext):
     if m.from_user.id != ADMIN_ID:
         return
-    
+
     text = m.text.strip()
-    
+
     if text.lower() in ['/cancel', 'отмена']:
         await state.clear()
         await m.answer("❌ Рассылка отменена.", reply_markup=get_admin_kb())
@@ -121,7 +146,7 @@ async def process_broadcast(m: types.Message, state: FSMContext):
 
     target_id = None
     message_text = text
-    
+
     if ":" in text:
         parts = text.split(":", 1)
         if parts[0].strip().isdigit():
@@ -139,7 +164,7 @@ async def process_broadcast(m: types.Message, state: FSMContext):
         users = await get_all_users_chat_ids()
         success, failed = 0, 0
         await m.answer(f"📢 Начало рассылки для {len(users)} пользователей...")
-        
+
         for uid in users:
             if uid == ADMIN_ID: continue
             try:
@@ -148,8 +173,8 @@ async def process_broadcast(m: types.Message, state: FSMContext):
             except Exception:
                 failed += 1
             await asyncio.sleep(0.05)
-            
+
         await m.answer(f"✅ Успешно: {success}\n❌ Ошибок: {failed}")
         await log_action(m.from_user.id, f"broadcast_all_{success}_{failed}")
-    
+
     await state.clear()
