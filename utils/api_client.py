@@ -15,9 +15,11 @@ GLOBAL_SESSION: Optional[RetryClient] = None
 SCHEDULE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def get_tz_now() -> datetime:
+    """Возвращает текущее локальное время с учетом смещения часового пояса."""
     return datetime.now(timezone(timedelta(hours=LOCAL_TIMEZONE_OFFSET)))
 
 async def init_session():
+    """Инициализация глобальной HTTP-сессии с экспоненциальными повторами при сетевых сбоях."""
     global GLOBAL_SESSION
     retry_options = ExponentialRetry(
         attempts=5,
@@ -29,16 +31,19 @@ async def init_session():
     logger.info("API Session initialized with retries")
 
 async def close_session():
+    """Корректное закрытие сессии при завершении работы бота."""
     global GLOBAL_SESSION
     if GLOBAL_SESSION:
         await GLOBAL_SESSION.close()
         logger.info("API Session closed")
 
 def _calculate_hash(data: list) -> str:
+    """Генерация контрольного MD5-хеша для детекции изменений в расписании."""
     dump = json.dumps(data, sort_keys=True).encode('utf-8')
     return hashlib.md5(dump).hexdigest()
 
 async def get_week_id(date_str: str) -> Optional[str]:
+    """Получение идентификатора учебной недели по любой дате из этой недели."""
     if not GLOBAL_SESSION:
         logger.error("Session not initialized!")
         return None
@@ -56,6 +61,7 @@ async def get_week_id(date_str: str) -> Optional[str]:
     return None
 
 async def fetch_schedule_raw(group_key: str, target_date: Optional[str] = None) -> List:
+    """Запрос сырых данных пар из API колледжа на основе week_id."""
     if not GLOBAL_SESSION:
         logger.error("Session not initialized!")
         return []
@@ -66,6 +72,7 @@ async def fetch_schedule_raw(group_key: str, target_date: Optional[str] = None) 
     group_id = GROUPS_CONFIG[group_key]['id']
     req_date = target_date if target_date else get_tz_now().strftime("%Y-%m-%d")
     
+    # В воскресенье по умолчанию смотрим вперед на следующий рабочий понедельник
     if not target_date and get_tz_now().weekday() == 6:
         next_mon = get_tz_now() + timedelta(days=(7 - get_tz_now().weekday()))
         req_date = next_mon.strftime("%Y-%m-%d")
@@ -92,6 +99,7 @@ async def fetch_schedule_raw(group_key: str, target_date: Optional[str] = None) 
     return []
 
 def parse_lessons(raw_data: list, target_date: Optional[str] = None) -> list:
+    """Парсинг и нормализация списка занятий с опциональной фильтрацией по конкретному дню."""
     lessons = []
     if not isinstance(raw_data, list):
         return lessons
@@ -99,6 +107,7 @@ def parse_lessons(raw_data: list, target_date: Optional[str] = None) -> list:
     for item in raw_data:
         if not isinstance(item, dict):
             continue
+        # Если передан target_date, отдаем только пары этого конкретного дня
         if target_date and item.get('date') != target_date:
             continue
         
@@ -128,11 +137,17 @@ def parse_lessons(raw_data: list, target_date: Optional[str] = None) -> list:
     lessons.sort(key=lambda x: x['lesson_number'])
     return lessons
 
-async def get_schedule(group_key: str, target_date: Optional[str] = None, force_refresh: bool = False) -> Tuple[List, bool]:
-    cache_key = f"{group_key}:{target_date or 'today'}"
+async def get_schedule(group_key: str, target_date: Optional[str] = None, force_refresh: bool = False, is_week: bool = False) -> Tuple[List, bool]:
+    """
+    Основная точка входа для получения расписания:
+    - Поддерживает раздельный кэш для запросов дня и недели.
+    - При is_week=True загружает неделю по target_date, не обрезая остальные учебные дни.
+    """
+    mode = "week" if is_week else "day"
+    cache_key = f"{group_key}:{target_date or 'today'}:{mode}"
     now_ts = datetime.now().timestamp()
 
-    # 1. Проверка кэша
+    # 1. Проверка актуальности кэша
     if not force_refresh and cache_key in SCHEDULE_CACHE:
         entry = SCHEDULE_CACHE[cache_key]
         if now_ts - entry['timestamp'] < CACHE_TTL_SECONDS:
@@ -142,12 +157,16 @@ async def get_schedule(group_key: str, target_date: Optional[str] = None, force_
             logger.debug(f"Cache EXPIRED: {cache_key}")
             del SCHEDULE_CACHE[cache_key]
 
-    # 2. Запрос к API
+    # 2. Запрос к API колледжа
     logger.debug(f"Fetching API for: {cache_key}")
     raw_data = await fetch_schedule_raw(group_key, target_date)
-    parsed_data = parse_lessons(raw_data, target_date)
     
-    # 3. Детектор изменений
+    # КРИТИЧЕСКИЙ МОМЕНТ: если запрашивается вся неделя (текущая или следующая),
+    # передаем в parse_lessons target_date=None, чтобы не отфильтровать вторник-субботу.
+    filter_date = None if is_week else target_date
+    parsed_data = parse_lessons(raw_data, filter_date)
+    
+    # 3. Детектор изменений (сравнение хешей)
     new_hash = _calculate_hash(parsed_data)
     changes_detected = False
     
@@ -157,7 +176,7 @@ async def get_schedule(group_key: str, target_date: Optional[str] = None, force_
             changes_detected = True
             logger.info(f"CHANGES DETECTED for {cache_key}!")
     
-    # 4. Обновление кэша
+    # 4. Обновление локального кэша
     SCHEDULE_CACHE[cache_key] = {
         'data': parsed_data,
         'timestamp': now_ts,
@@ -167,7 +186,8 @@ async def get_schedule(group_key: str, target_date: Optional[str] = None, force_
     return parsed_data, changes_detected
 
 async def invalidate_cache_for_group(group_key: str):
+    """Инвалидация кэша для указанной группы."""
     keys_to_delete = [k for k in SCHEDULE_CACHE.keys() if k.startswith(f"{group_key}:")]
     for k in keys_to_delete:
         del SCHEDULE_CACHE[k]
-    logger.info(f"Cache invalidated for group {group_key}") 
+    logger.info(f"Cache invalidated for group {group_key}")

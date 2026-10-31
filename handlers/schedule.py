@@ -29,6 +29,22 @@ class UserStates(StatesGroup):
     wait_avatar_photo = State()
     wait_broadcast_text = State()
 
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДАТ ---
+
+def get_week_bounds(now_dt: datetime, shift_weeks: int = 0):
+    """
+    Вычисляет даты понедельника и субботы с учетом сдвига недель (shift_weeks).
+    В воскресенье базовой неделей считается наступающая рабочая неделя.
+    """
+    if now_dt.weekday() == 6:
+        base_monday = now_dt + timedelta(days=1)
+    else:
+        base_monday = now_dt - timedelta(days=now_dt.weekday())
+
+    target_monday = base_monday + timedelta(weeks=shift_weeks)
+    target_saturday = target_monday + timedelta(days=5)
+    return target_monday, target_saturday
+
 # --- КЛАВИАТУРЫ ---
 
 def get_group_select_keyboard():
@@ -78,6 +94,36 @@ def get_main_keyboard(chat_id: int = None):
     buttons.append(admin_row)
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_schedule_nav_keyboard(current_action: str):
+    """
+    Клавиатура навигации под блоком расписания:
+    - Переключение между текущей и следующей неделей с точным интервалом дат.
+    - Кнопка принудительного обновления из API.
+    - Кнопка возврата в главное меню.
+    """
+    today = datetime.now(LOCAL_TZ)
+    curr_mon, curr_sat = get_week_bounds(today, shift_weeks=0)
+    next_mon, next_sat = get_week_bounds(today, shift_weeks=1)
+
+    curr_str = f"{curr_mon.strftime('%d.%m')} - {curr_sat.strftime('%d.%m')}"
+    next_str = f"{next_mon.strftime('%d.%m')} - {next_sat.strftime('%d.%m')}"
+
+    keyboard = []
+
+    if current_action == "sch_week":
+        keyboard.append([
+            InlineKeyboardButton(text=f"📆 След. неделя ({next_str}) ❯", callback_data="sch_next_week")
+        ])
+    elif current_action == "sch_next_week":
+        keyboard.append([
+            InlineKeyboardButton(text=f"❮ 📆 Тек. неделя ({curr_str})", callback_data="sch_week")
+        ])
+
+    keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=current_action)])
+    keyboard.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_notify_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -515,17 +561,24 @@ async def handle_schedule(c: types.CallbackQuery, state: FSMContext):
     target_date = None
     title = ""
     is_week = False
+    today = datetime.now(LOCAL_TZ)
     
+    # 1. Текущая неделя (в воскресенье берется наступающая)
     if action == "sch_week":
         is_week = True
-        today = datetime.now(LOCAL_TZ)
-        if today.weekday() == 6:
-            start = today + timedelta(days=1)
-            title = f"Неделя ({start.strftime('%d.%m')} - {(start+timedelta(days=5)).strftime('%d.%m')}) (След.)"
-        else:
-            start = today - timedelta(days=today.weekday())
-            title = f"Неделя ({start.strftime('%d.%m')} - {(start+timedelta(days=5)).strftime('%d.%m')})"
-            
+        start_mon, end_sat = get_week_bounds(today, shift_weeks=0)
+        suffix = " (След.)" if today.weekday() == 6 else ""
+        title = f"Неделя ({start_mon.strftime('%d.%m')} - {end_sat.strftime('%d.%m')}){suffix}"
+        target_date = start_mon.strftime("%Y-%m-%d")
+
+    # 2. Следующая неделя со сдвигом на +1 неделю вперед
+    elif action == "sch_next_week":
+        is_week = True
+        start_mon, end_sat = get_week_bounds(today, shift_weeks=1)
+        title = f"След. неделя ({start_mon.strftime('%d.%m')} - {end_sat.strftime('%d.%m')})"
+        target_date = start_mon.strftime("%Y-%m-%d")
+
+    # 3. Конкретный день недели
     elif action.startswith("sch_day_"):
         target_date = action.replace("sch_day_", "")
         try:
@@ -538,10 +591,12 @@ async def handle_schedule(c: types.CallbackQuery, state: FSMContext):
     await c.answer("⏳ Загрузка...")
     
     try:
-        lessons, changes = await get_schedule(user_group, target_date if not is_week else None)
+        # Передаем target_date опорного дня и флаг is_week, гарантирующий выдачу всех учебных дней недели
+        lessons, changes = await get_schedule(user_group, target_date=target_date, is_week=is_week)
         text = format_schedule_text(title, lessons, is_week, datetime.now(LOCAL_TZ))
         
-        kb = InlineKeyboardMarkup(inline_keyboard=[
+        # Генерация навигации под расписанием
+        kb = get_schedule_nav_keyboard(action) if is_week else InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Обновить", callback_data=action)],
             [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
         ])
