@@ -1,38 +1,51 @@
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
+import sys
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramConflictError, TelegramNetworkError
+
 from config import BOT_TOKEN, ADMIN_ID, PROXY_URL
 from database import init_db, close_db_connection, get_all_users, get_user_settings
 from utils.api_client import init_session, close_session
 from middlewares.throttling import ThrottlingMiddleware
 from handlers import admin, schedule, worker
 
-logger = logging.getLogger(__name__)
+# Обработчик с мгновенным сбросом буфера на диск для tail -f
+class InstantRotatingFileHandler(RotatingFileHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
 
-file_handler = RotatingFileHandler("bot.log", maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
-file_handler.setLevel(logging.DEBUG)
+# Настройка ROOT-логгера: логи пишутся со всех модулей (handlers, utils, main)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+file_handler = InstantRotatingFileHandler("bot.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
 file_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 file_handler.setFormatter(file_formatter)
 
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.WARNING)
+console_handler = logging.StreamHandler(sys.stdout)
 console_formatter = logging.Formatter("✅ %(levelname)s: %(message)s")
 console_handler.setFormatter(console_formatter)
 
-logger.setLevel(logging.DEBUG)
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+root_logger.handlers.clear()
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
 
 logging.getLogger("aiogram").setLevel(logging.WARNING)
-logging.getLogger("aiogram").addHandler(file_handler)
+logger = logging.getLogger(__name__)
 
 dp = Dispatcher()
 dp.include_router(admin.router)
 dp.include_router(schedule.router)
-dp.update.middleware(ThrottlingMiddleware(delay=0.05))
+
+# Защита от флуда и спама кнопками (0.5 сек между запросами)
+dp.callback_query.middleware(ThrottlingMiddleware(rate_limit=0.5))
+dp.message.middleware(ThrottlingMiddleware(rate_limit=0.5))
 
 async def on_startup(bot: Bot):
     logger.info("--- ЗАПУСК БОТА (PRO VERSION) ---")
@@ -42,37 +55,27 @@ async def on_startup(bot: Bot):
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook сброшен, БД и сессии готовы")
 
-        try:
-            await bot.send_message(
-                ADMIN_ID, 
-                f"🤖 <b>БОТ ЗАПУЩЕН</b>\n\nНажмите /start для начала работы.\nЛоги пишутся в bot.log", 
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось уведомить админа: {e}")
-
-        users = await get_all_users()
-        count = 0
-        for u in users:
-            chat_id = u[0]
-            if chat_id == ADMIN_ID: continue
+        # Оповещение администратора о старте
+        if ADMIN_ID:
             try:
-                settings = await get_user_settings(chat_id)
-                if settings and len(settings) > 6 and settings[6] == 1:
-                    await bot.send_message(chat_id, "✅ <b>Бот обновлен</b>.", parse_mode="HTML")
-                    count += 1
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
+                await bot.send_message(
+                    ADMIN_ID,
+                    "🤖 <b>БОТ ЗАПУЩЕН</b>\n\nНажмите /start для начала работы.",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось уведомить админа: {e}")
 
-        if count > 0:
-            logger.info(f"Уведомлено о перезапуске {count} пользователям")
-
-        asyncio.create_task(worker.notification_worker(bot))
-        logger.info("Задача worker запущена")
+        # Фоновый воркер уведомлений о парах
+        if hasattr(worker, 'notification_worker'):
+            asyncio.create_task(worker.notification_worker(bot))
+            logger.info("Задача worker запущена")
+        elif hasattr(worker, 'start_worker'):
+            asyncio.create_task(worker.start_worker(bot))
+            logger.info("Задача worker запущена")
 
     except Exception as e:
-        logger.critical(f"Ошибка при старте: {e}")
+        logger.critical(f"Ошибка при старте: {e}", exc_info=True)
         raise
 
 async def on_shutdown(bot: Bot):
@@ -88,35 +91,42 @@ dp.startup.register(on_startup)
 dp.shutdown.register(on_shutdown)
 
 async def main():
+    session = None
     if PROXY_URL:
         logger.info(f"Используем прокси: {PROXY_URL}")
         session = AiohttpSession(proxy=PROXY_URL)
     else:
         session = AiohttpSession()
 
-    bot = Bot(token=BOT_TOKEN, session=session)
+    bot = Bot(
+        token=BOT_TOKEN,
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
 
     try:
         logger.info("Запуск polling...")
-        print("🚀 Бот запущен! (Логи в bot.log)")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     except KeyboardInterrupt:
         logger.info("Остановка по Ctrl+C")
     except TelegramConflictError:
-        logger.error("❌ Конфликт: бот уже запущен")
+        logger.error("❌ Конфликт: запущен дубликат бота с тем же токеном!")
     except TelegramNetworkError as e:
-        logger.error(f"❌ Сеть: {e}")
+        logger.error(f"❌ Сетевая ошибка Telegram: {e}")
     except Exception as e:
-        logger.critical(f"Критическая ошибка: {e}")
+        logger.critical(f"Критическая ошибка: {e}", exc_info=True)
     finally:
+        # Закрываем только сессию aiohttp.
+        # Метод bot.close() НЕ вызываем, чтобы избежать бана Flood Control на 500+ секунд.
         try:
-            await bot.session.close()
-            await bot.close()
+            if bot.session:
+                await bot.session.close()
+            logger.info("Сессия закрыта штатно")
         except Exception as e:
-            logger.error(f"Ошибка при закрытии бота: {e}")
+            logger.error(f"Ошибка закрытия сессии: {e}")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass

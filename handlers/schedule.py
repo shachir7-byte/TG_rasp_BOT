@@ -33,8 +33,8 @@ class UserStates(StatesGroup):
 
 def get_week_bounds(now_dt: datetime, shift_weeks: int = 0):
     """
-    Вычисляет даты понедельника и субботы с учетом сдвига недель (shift_weeks).
-    В воскресенье базовой неделей считается наступающая рабочая неделя.
+    Вычисляет даты понедельника и субботы с учетом сдвига недель.
+    В воскресенье базовой неделей считается наступающая учебная неделя.
     """
     if now_dt.weekday() == 6:
         base_monday = now_dt + timedelta(days=1)
@@ -96,12 +96,6 @@ def get_main_keyboard(chat_id: int = None):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_schedule_nav_keyboard(current_action: str):
-    """
-    Клавиатура навигации под блоком расписания:
-    - Переключение между текущей и следующей неделей с точным интервалом дат.
-    - Кнопка принудительного обновления из API.
-    - Кнопка возврата в главное меню.
-    """
     today = datetime.now(LOCAL_TZ)
     curr_mon, curr_sat = get_week_bounds(today, shift_weeks=0)
     next_mon, next_sat = get_week_bounds(today, shift_weeks=1)
@@ -110,7 +104,6 @@ def get_schedule_nav_keyboard(current_action: str):
     next_str = f"{next_mon.strftime('%d.%m')} - {next_sat.strftime('%d.%m')}"
 
     keyboard = []
-
     if current_action == "sch_week":
         keyboard.append([
             InlineKeyboardButton(text=f"📆 След. неделя ({next_str}) ❯", callback_data="sch_next_week")
@@ -173,6 +166,7 @@ def get_cancel_kb():
 @router.message(Command("start"))
 async def cmd_start(m: types.Message, state: FSMContext):
     await state.clear()
+    logger.info(f"👤 Команда /start от [{m.chat.id}|@{m.from_user.username}]")
     await save_user(m.chat.id, m.from_user.username, 'is')
     await log_action(m.chat.id, "start")
     kb = get_main_keyboard(m.chat.id)
@@ -181,6 +175,7 @@ async def cmd_start(m: types.Message, state: FSMContext):
 @router.message(Command("menu"))
 async def cmd_menu(m: types.Message, state: FSMContext):
     await state.clear()
+    logger.info(f"👤 Команда /menu от [{m.chat.id}|@{m.from_user.username}]")
     group_key = await get_user_group(m.chat.id)
     groups = await get_groups_config()
     group_name = groups.get(group_key, {}).get('name', 'ИС')
@@ -191,6 +186,7 @@ async def cmd_menu(m: types.Message, state: FSMContext):
 async def handle_group_select(c: types.CallbackQuery, state: FSMContext):
     await state.clear()
     group_key = c.data.replace("group_", "")
+    logger.info(f"🔘 Выбор группы '{group_key}' пользователем [{c.from_user.id}|@{c.from_user.username}]")
     groups = await get_groups_config()
     group_name = groups.get(group_key, {}).get('name', 'Неизвестно')
     
@@ -205,11 +201,15 @@ async def handle_group_select(c: types.CallbackQuery, state: FSMContext):
         )
     except Exception:
         pass
-    await c.answer()
+    try:
+        await c.answer()
+    except Exception:
+        pass
 
 @router.callback_query(F.data == "main_menu")
 async def handle_main_menu(c: types.CallbackQuery, state: FSMContext):
     await state.clear()
+    logger.info(f"🔘 Возврат в главное меню [{c.from_user.id}|@{c.from_user.username}]")
     group_key = await get_user_group(c.from_user.id)
     groups = await get_groups_config()
     group_name = groups.get(group_key, {}).get('name', 'ИС')
@@ -221,7 +221,10 @@ async def handle_main_menu(c: types.CallbackQuery, state: FSMContext):
         )
     except Exception:
         pass
-    await c.answer()
+    try:
+        await c.answer()
+    except Exception:
+        pass
 
 @router.callback_query(F.data == "change_group")
 async def handle_change_group(c: types.CallbackQuery, state: FSMContext):
@@ -230,7 +233,90 @@ async def handle_change_group(c: types.CallbackQuery, state: FSMContext):
         await c.message.edit_text("🔄 <b>Сменить группу</b>", reply_markup=get_group_select_keyboard(), parse_mode="HTML")
     except Exception:
         pass
-    await c.answer()
+    try:
+        await c.answer()
+    except Exception:
+        pass
+
+# --- РАСПИСАНИЕ И НАВИГАЦИЯ ПО НЕДЕЛЯМ ---
+
+@router.callback_query(F.data.startswith("sch_"))
+async def handle_schedule(c: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    action = c.data
+    user_id = c.from_user.id
+    username = c.from_user.username or "no_user"
+    
+    logger.info(f"👉 КЛИК КНОПКИ: '{action}' от [{user_id}|@{username}]")
+    
+    user_group = await get_user_group(user_id)
+    await increment_request_count(user_id)
+    await log_action(user_id, action)
+    
+    target_date = None
+    title = ""
+    is_week = False
+    today = datetime.now(LOCAL_TZ)
+    
+    # 1. Запрос текущей недели
+    if action == "sch_week":
+        is_week = True
+        start_mon, end_sat = get_week_bounds(today, shift_weeks=0)
+        suffix = " (След.)" if today.weekday() == 6 else ""
+        title = f"Неделя ({start_mon.strftime('%d.%m')} - {end_sat.strftime('%d.%m')}){suffix}"
+        target_date = start_mon.strftime("%Y-%m-%d")
+
+    # 2. Запрос следующей недели
+    elif action == "sch_next_week":
+        is_week = True
+        start_mon, end_sat = get_week_bounds(today, shift_weeks=1)
+        title = f"След. неделя ({start_mon.strftime('%d.%m')} - {end_sat.strftime('%d.%m')})"
+        target_date = start_mon.strftime("%Y-%m-%d")
+
+    # 3. Запрос конкретного дня
+    elif action.startswith("sch_day_"):
+        target_date = action.replace("sch_day_", "")
+        try:
+            d_obj = datetime.strptime(target_date, "%Y-%m-%d")
+            DAYS_OF_WEEK = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
+            title = f"{DAYS_OF_WEEK[d_obj.weekday()]}, {d_obj.strftime('%d.%m.%Y')}"
+        except Exception:
+            title = target_date
+
+    try:
+        await c.answer("⏳ Загрузка...")
+    except Exception:
+        pass
+    
+    try:
+        logger.info(f"⏳ Запрос расписания для '{user_group}' (дата: {target_date}, is_week={is_week})...")
+        lessons, changes = await get_schedule(user_group, target_date=target_date, is_week=is_week)
+        
+        if lessons is None:
+            text = (
+                "⚠️ <b>Сервер колледжа временно перегружен</b>\n\n"
+                "Сайт sielom.ru не ответил вовремя. Нажмите «🔄 Обновить» через пару секунд."
+            )
+        else:
+            logger.info(f"📄 Форматирование: найдено {len(lessons)} пар")
+            text = format_schedule_text(title, lessons, is_week, datetime.now(LOCAL_TZ))
+        
+        kb = get_schedule_nav_keyboard(action) if is_week else InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=action)],
+            [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
+        ])
+        
+        try:
+            await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            logger.info(f"✅ Сообщение обновлено для [{user_id}]")
+        except Exception as e:
+            if "message is not modified" not in str(e):
+                logger.warning(f"edit_text не сработал ({e}), отправляем новым сообщением")
+                await c.message.answer(text, reply_markup=kb, parse_mode="HTML")
+                
+    except Exception as e:
+        logger.error(f"❌ Ошибка в handle_schedule: {e}", exc_info=True)
+        await c.message.answer("❌ Ошибка загрузки расписания", reply_markup=get_main_keyboard(user_id))
 
 # --- УВЕДОМЛЕНИЯ И СВОЁ ВРЕМЯ ---
 
@@ -251,7 +337,10 @@ async def handle_notify_menu(c: types.CallbackQuery, state: FSMContext):
         await c.message.edit_text(text, reply_markup=get_notify_menu_kb(), parse_mode="HTML")
     except Exception:
         pass
-    await c.answer()
+    try:
+        await c.answer()
+    except Exception:
+        pass
 
 @router.callback_query(F.data == "notify_type_time")
 async def handle_notify_type_time(c: types.CallbackQuery, state: FSMContext):
@@ -260,7 +349,10 @@ async def handle_notify_type_time(c: types.CallbackQuery, state: FSMContext):
         await c.message.edit_text("⏰ <b>Уведомлять в определенное время</b>", reply_markup=get_notify_time_kb(), parse_mode="HTML")
     except Exception:
         pass
-    await c.answer()
+    try:
+        await c.answer()
+    except Exception:
+        pass
 
 @router.callback_query(F.data == "notify_type_offset")
 async def handle_notify_type_offset(c: types.CallbackQuery, state: FSMContext):
@@ -269,7 +361,10 @@ async def handle_notify_type_offset(c: types.CallbackQuery, state: FSMContext):
         await c.message.edit_text("⏳ <b>Уведомлять за время до первой пары</b>", reply_markup=get_notify_offset_kb(), parse_mode="HTML")
     except Exception:
         pass
-    await c.answer()
+    try:
+        await c.answer()
+    except Exception:
+        pass
 
 @router.callback_query(F.data.startswith("notify_time_"))
 async def handle_notify_set_time(c: types.CallbackQuery, state: FSMContext):
@@ -281,14 +376,16 @@ async def handle_notify_set_time(c: types.CallbackQuery, state: FSMContext):
         ])
         try:
             await c.message.edit_text(
-                "✏️ <b>Введите своё время</b>\n\n"
-                "Напишите время в формате <code>ЧЧ:ММ</code> (например, <code>07:30</code> или <code>06:45</code>):",
+                "✏️ <b>Введите своё время</b>\n\nФормат: <code>ЧЧ:ММ</code> (например, <code>07:30</code>):",
                 reply_markup=kb,
                 parse_mode="HTML"
             )
         except Exception:
             pass
-        await c.answer()
+        try:
+            await c.answer()
+        except Exception:
+            pass
         return
         
     await update_notify_settings(c.from_user.id, time=val, n_type='time', offset=0)
@@ -297,7 +394,10 @@ async def handle_notify_set_time(c: types.CallbackQuery, state: FSMContext):
         await c.message.edit_text(f"✅ Уведомления установлены на <b>{val}</b>", reply_markup=get_notify_menu_kb(), parse_mode="HTML")
     except Exception:
         pass
-    await c.answer()
+    try:
+        await c.answer()
+    except Exception:
+        pass
 
 @router.message(UserStates.wait_custom_time)
 async def process_custom_time(m: types.Message, state: FSMContext):
@@ -311,18 +411,12 @@ async def process_custom_time(m: types.Message, state: FSMContext):
 
     match = re.match(r"^(\d{1,2}):(\d{2})$", raw_text)
     if not match:
-        await m.answer(
-            "⚠️ <b>Неверный формат!</b>\nВведите время через двоеточие, например: <code>07:30</code>",
-            parse_mode="HTML"
-        )
+        await m.answer("⚠️ Неверный формат! Введите время как <code>07:30</code>:", parse_mode="HTML")
         return
 
     hours, minutes = int(match.group(1)), int(match.group(2))
     if not (0 <= hours <= 23 and 0 <= minutes <= 59):
-        await m.answer(
-            "⚠️ <b>Некорректное время!</b>\nЧасы должны быть от 00 до 23, а минуты — от 00 до 59.",
-            parse_mode="HTML"
-        )
+        await m.answer("⚠️ Некорректное время! Часы: 00-23, Минуты: 00-59.", parse_mode="HTML")
         return
 
     formatted_time = f"{hours:02d}:{minutes:02d}"
@@ -331,7 +425,7 @@ async def process_custom_time(m: types.Message, state: FSMContext):
     await state.clear()
 
     await m.answer(
-        f"✅ Своё время уведомлений установлено на <b>{formatted_time}</b>!",
+        f"✅ Время уведомлений установлено на <b>{formatted_time}</b>!",
         reply_markup=get_notify_menu_kb(),
         parse_mode="HTML"
     )
@@ -345,7 +439,10 @@ async def handle_notify_set_offset(c: types.CallbackQuery):
         await c.message.edit_text(f"✅ Установлено: за <b>{off} ч.</b> до пары", reply_markup=get_notify_menu_kb(), parse_mode="HTML")
     except Exception:
         pass
-    await c.answer()
+    try:
+        await c.answer()
+    except Exception:
+        pass
 
 @router.callback_query(F.data == "notify_delete")
 async def handle_notify_delete(c: types.CallbackQuery):
@@ -355,59 +452,66 @@ async def handle_notify_delete(c: types.CallbackQuery):
         await c.message.edit_text("🔕 <b>Уведомления отключены</b>", reply_markup=get_notify_menu_kb(), parse_mode="HTML")
     except Exception:
         pass
-    await c.answer()
+    try:
+        await c.answer()
+    except Exception:
+        pass
 
-# --- ПОМОЩЬ, ДОНАТЫ И МАГАЗИН ЗА ЗВЁЗДЫ (TELEGRAM STARS) ---
+# --- ПОМОЩЬ И МАГАЗИН (STARS) ---
 
 @router.callback_query(F.data == "help")
 async def handle_help(c: types.CallbackQuery, state: FSMContext):
     await state.clear()
     text = (
         "ℹ️ <b>Помощь</b>\n\n"
-        "Этот бот показывает расписание занятий и умеет присылать уведомления перед парами.\n"
-        "Используй кнопки внизу для навигации.\n\n"
+        "Бот отображает расписание занятий и присылает уведомления перед парами.\n\n"
         "/start — Главное меню\n"
-        "/menu — Показать расписание\n\n"
-        "⭐ <i>Ты также можешь поддержать бота звёздами или заказать кастомные фичи в магазине ниже!</i>"
+        "/menu — Выбор расписания\n\n"
+        "⭐ <i>Вы можете поддержать проект звёздами Telegram в меню ниже:</i>"
     )
     try:
         await c.message.edit_text(text, reply_markup=get_help_kb(), parse_mode="HTML")
     except Exception:
         pass
-    await c.answer()
+    try:
+        await c.answer()
+    except Exception:
+        pass
 
 @router.callback_query(F.data == "donate_menu")
 async def handle_donate_menu(c: types.CallbackQuery, state: FSMContext):
     await state.clear()
     text = (
         "⭐ <b>Магазин и поддержка (Telegram Stars)</b>\n\n"
-        "Выбери действие:\n"
-        "• 🖼 <b>Сменить аву бота (67 ⭐)</b> — после оплаты ты сможешь отправить любую адекватную картинку, и мы поставим её на аватарку бота.\n"
-        "• 📢 <b>Общее сообщение (20 ⭐)</b> — твой текст увидят все пользователи бота с подписью, от кого это сообщение.\n"
-        "• ☕ <b>Поддержать автора (15 ⭐)</b> — просто закинуть звёзд на развитие и хостинг."
+        "• 🖼 <b>Сменить аву бота (67 ⭐)</b> — поставить свою картинку на аватарку бота.\n"
+        "• 📢 <b>Общее сообщение всем (20 ⭐)</b> — отправить текст всем пользователям бота.\n"
+        "• ☕ <b>Поддержать автора (15 ⭐)</b> — донат на хостинг и развитие."
     )
     try:
         await c.message.edit_text(text, reply_markup=get_donate_menu_kb(), parse_mode="HTML")
     except Exception:
         pass
-    await c.answer()
+    try:
+        await c.answer()
+    except Exception:
+        pass
 
 @router.callback_query(F.data.in_({"buy_avatar_67", "buy_broadcast_20", "buy_support_15"}))
 async def handle_buy_stars(c: types.CallbackQuery):
     item = c.data
     if item == "buy_avatar_67":
         title = "🖼 Смена аватарки бота"
-        description = "Право установить свою картинку на аватарку бота"
+        description = "Установка вашей картинки на аватарку бота"
         amount = 67
         payload = "stars_avatar_67"
     elif item == "buy_broadcast_20":
         title = "📢 Общее сообщение всем"
-        description = "Отправка вашего сообщения всем пользователям бота"
+        description = "Рассылка вашего сообщения всем пользователям бота"
         amount = 20
         payload = "stars_broadcast_20"
     else:
         title = "☕ Поддержка проекта"
-        description = "Донат на развитие и сервер для бота"
+        description = "Донат на поддержку сервера бота"
         amount = 15
         payload = "stars_support_15"
 
@@ -416,11 +520,14 @@ async def handle_buy_stars(c: types.CallbackQuery):
         title=title,
         description=description,
         payload=payload,
-        provider_token="",  # Строго пустая строка для Telegram Stars (XTR)
+        provider_token="",
         currency="XTR",
         prices=[LabeledPrice(label=title, amount=amount)]
     )
-    await c.answer()
+    try:
+        await c.answer()
+    except Exception:
+        pass
 
 @router.pre_checkout_query()
 async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
@@ -434,31 +541,27 @@ async def process_successful_payment(m: types.Message, state: FSMContext):
     if payload == "stars_avatar_67":
         await state.set_state(UserStates.wait_avatar_photo)
         await m.answer(
-            "🎉 <b>Оплата 67 ⭐ прошла успешно!</b>\n\n"
-            "📸 Теперь отправь мне <b>фотографию</b> (именно как картинку, не файлом), которую нужно поставить на аватарку бота.\n"
-            "<i>Для отмены напиши /cancel</i>",
+            "🎉 <b>Оплата 67 ⭐ принята!</b>\n\nОтправьте фото для аватарки бота (как картинку, не файлом):",
             reply_markup=get_cancel_kb(),
             parse_mode="HTML"
         )
     elif payload == "stars_broadcast_20":
         await state.set_state(UserStates.wait_broadcast_text)
         await m.answer(
-            "🎉 <b>Оплата 20 ⭐ прошла успешно!</b>\n\n"
-            "✍️ Напиши одним сообщением <b>текст</b>, который мы разошлём всем пользователям бота от твоего имени.\n"
-            "<i>Для отмены напиши /cancel</i>",
+            "🎉 <b>Оплата 20 ⭐ принята!</b>\n\nНапишите текст рассылки всем пользователям:",
             reply_markup=get_cancel_kb(),
             parse_mode="HTML"
         )
     elif payload == "stars_support_15":
         await m.answer(
-            "💖 <b>Огромное спасибо за поддержку!</b>\nТвои звёзды помогут боту работать ещё быстрее и стабильнее!",
+            "💖 <b>Большое спасибо за поддержку проекта!</b>",
             reply_markup=get_main_keyboard(m.chat.id),
             parse_mode="HTML"
         )
         if ADMIN_ID:
             user_tag = f"@{m.from_user.username}" if m.from_user.username else f"ID {m.from_user.id}"
             try:
-                await m.bot.send_message(ADMIN_ID, f"☕ Пользователь {user_tag} задонатил <b>15 ⭐</b>!", parse_mode="HTML")
+                await m.bot.send_message(ADMIN_ID, f"☕ Пользователь {user_tag} отправил донат <b>15 ⭐</b>!", parse_mode="HTML")
             except Exception:
                 pass
 
@@ -466,15 +569,11 @@ async def process_successful_payment(m: types.Message, state: FSMContext):
 async def process_avatar_photo(m: types.Message, state: FSMContext):
     if m.text and m.text.strip().lower() in ['/cancel', 'отмена', '/start']:
         await state.clear()
-        await m.answer("❌ Действие отменено.", reply_markup=get_main_keyboard(m.chat.id))
+        await m.answer("❌ Отменено.", reply_markup=get_main_keyboard(m.chat.id))
         return
 
     if not m.photo:
-        await m.answer(
-            "⚠️ Пожалуйста, отправь именно <b>картинку/фотографию</b> (или напиши /cancel для отмены)!",
-            reply_markup=get_cancel_kb(),
-            parse_mode="HTML"
-        )
+        await m.answer("⚠️ Пожалуйста, отправьте именно фото (или /cancel):", reply_markup=get_cancel_kb())
         return
 
     photo_file_id = m.photo[-1].file_id
@@ -485,11 +584,7 @@ async def process_avatar_photo(m: types.Message, state: FSMContext):
             await m.bot.send_photo(
                 chat_id=ADMIN_ID,
                 photo=photo_file_id,
-                caption=(
-                    f"🖼 <b>Оплачена смена аватарки (67 ⭐)!</b>\n"
-                    f"От кого: {user_tag} (<code>{m.from_user.id}</code>)\n\n"
-                    f"Поставь это фото через @BotFather -> Edit Botpic."
-                ),
+                caption=f"🖼 <b>Оплачена смена аватарки (67 ⭐)!</b>\nОт: {user_tag} (<code>{m.from_user.id}</code>)",
                 parse_mode="HTML"
             )
         except Exception as e:
@@ -497,11 +592,7 @@ async def process_avatar_photo(m: types.Message, state: FSMContext):
 
     await state.clear()
     await log_action(m.from_user.id, "avatar_photo_submitted")
-    await m.answer(
-        "✅ <b>Картинка принята и передана на установку!</b>\nСкоро аватарка бота обновится.",
-        reply_markup=get_main_keyboard(m.chat.id),
-        parse_mode="HTML"
-    )
+    await m.answer("✅ <b>Картинка передана администратору!</b>", reply_markup=get_main_keyboard(m.chat.id), parse_mode="HTML")
 
 async def _run_paid_broadcast(bot: Bot, sender_id: int, users: list, broadcast_message: str):
     sent = 0
@@ -522,11 +613,11 @@ async def process_paid_broadcast_text(m: types.Message, state: FSMContext):
         return
 
     if not m.text:
-        await m.answer("⚠️ Пожалуйста, напиши текстовое сообщение для рассылки (или /cancel для отмены).", reply_markup=get_cancel_kb())
+        await m.answer("⚠️ Пожалуйста, напишите текст рассылки (или /cancel):", reply_markup=get_cancel_kb())
         return
 
     if len(m.text.strip()) > 1000:
-        await m.answer("⚠️ Сообщение слишком длинное (максимум 1000 символов). Сократи его и отправь снова:")
+        await m.answer("⚠️ Сообщение длиннее 1000 символов. Сократите его:")
         return
 
     await state.clear()
@@ -541,94 +632,18 @@ async def process_paid_broadcast_text(m: types.Message, state: FSMContext):
 
     users = await get_all_users_chat_ids()
     asyncio.create_task(_run_paid_broadcast(m.bot, m.from_user.id, users, broadcast_message))
+    await m.answer("🚀 <b>Сообщение отправлено в рассылку!</b>", reply_markup=get_main_keyboard(m.chat.id), parse_mode="HTML")
 
-    await m.answer(
-        "🚀 <b>Твоё сообщение отправлено в очередь рассылки и рассылается прямо сейчас!</b>",
-        reply_markup=get_main_keyboard(m.chat.id),
-        parse_mode="HTML"
-    )
-
-# --- РАСПИСАНИЕ ---
-
-@router.callback_query(F.data.startswith("sch_"))
-async def handle_schedule(c: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    action = c.data
-    user_group = await get_user_group(c.from_user.id)
-    await increment_request_count(c.from_user.id)
-    await log_action(c.from_user.id, action)
-    
-    target_date = None
-    title = ""
-    is_week = False
-    today = datetime.now(LOCAL_TZ)
-    
-    # 1. Текущая неделя (в воскресенье берется наступающая)
-    if action == "sch_week":
-        is_week = True
-        start_mon, end_sat = get_week_bounds(today, shift_weeks=0)
-        suffix = " (След.)" if today.weekday() == 6 else ""
-        title = f"Неделя ({start_mon.strftime('%d.%m')} - {end_sat.strftime('%d.%m')}){suffix}"
-        target_date = start_mon.strftime("%Y-%m-%d")
-
-    # 2. Следующая неделя со сдвигом на +1 неделю вперед
-    elif action == "sch_next_week":
-        is_week = True
-        start_mon, end_sat = get_week_bounds(today, shift_weeks=1)
-        title = f"След. неделя ({start_mon.strftime('%d.%m')} - {end_sat.strftime('%d.%m')})"
-        target_date = start_mon.strftime("%Y-%m-%d")
-
-    # 3. Конкретный день недели
-    elif action.startswith("sch_day_"):
-        target_date = action.replace("sch_day_", "")
-        try:
-            d_obj = datetime.strptime(target_date, "%Y-%m-%d")
-            DAYS_OF_WEEK = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
-            title = f"{DAYS_OF_WEEK[d_obj.weekday()]}, {d_obj.strftime('%d.%m.%Y')}"
-        except Exception:
-            title = target_date
-
-    await c.answer("⏳ Загрузка...")
-    
-    try:
-        # Передаем target_date опорного дня и флаг is_week, гарантирующий выдачу всех учебных дней недели
-        lessons, changes = await get_schedule(user_group, target_date=target_date, is_week=is_week)
-        text = format_schedule_text(title, lessons, is_week, datetime.now(LOCAL_TZ))
-        
-        # Генерация навигации под расписанием
-        kb = get_schedule_nav_keyboard(action) if is_week else InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data=action)],
-            [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
-        ])
-        
-        try:
-            await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-        except Exception as e:
-            if "message is not modified" not in str(e):
-                logger.error(f"Ошибка редактирования: {e}")
-                await c.message.answer(text, reply_markup=kb, parse_mode="HTML")
-                
-    except Exception as e:
-        logger.error(f"Schedule error: {e}")
-        await c.message.answer("❌ Ошибка загрузки расписания", reply_markup=get_main_keyboard(c.from_user.id))
-
-# --- ФОЛБЭК ДЛЯ НЕИЗВЕСТНЫХ СООБЩЕНИЙ ---
+# --- ФОЛБЭКИ ---
 
 @router.message(F.text & ~F.text.startswith('/'))
 async def handle_text_message(m: types.Message, state: FSMContext):
     if await state.get_state():
         return
-
     kb = get_main_keyboard(m.chat.id)
-    await m.answer(
-        "❓ <b>Я не понял команду.</b>\nНажми /start или выбери кнопку в меню 👇",
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
-    logger.info(f"User {m.from_user.id} sent unknown text: '{m.text}'")
+    await m.answer("❓ <b>Команда не распознана.</b>\nИспользуйте меню ниже 👇", reply_markup=kb, parse_mode="HTML")
 
 @router.message(F.text & F.text.startswith('/'))
 async def handle_unknown_command(m: types.Message, state: FSMContext):
     await state.clear()
-    await m.answer("❓ <b>Такой команды нет.</b>\nИспользуй /start", parse_mode="HTML")
-    logger.info(f"User {m.from_user.id} sent unknown command: '{m.text}'")
+    await m.answer("❓ <b>Неизвестная команда.</b> Нажмите /start", parse_mode="HTML")
