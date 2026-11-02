@@ -15,13 +15,12 @@ GLOBAL_SESSION: Optional[RetryClient] = None
 SCHEDULE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def get_tz_now() -> datetime:
-    """Возвращает текущее локальное время с учетом смещения часового пояса."""
     return datetime.now(timezone(timedelta(hours=LOCAL_TIMEZONE_OFFSET)))
 
 async def init_session():
-    """Инициализация асинхронной HTTP-сессии с увеличенными таймаутами."""
     global GLOBAL_SESSION
-    timeout = aiohttp.ClientTimeout(total=30.0, connect=15.0)
+    # Увеличены таймауты из-за высокой нагрузки на сервер колледжа
+    timeout = aiohttp.ClientTimeout(total=45.0, connect=20.0)
     retry_options = ExponentialRetry(
         attempts=3,
         start_timeout=1.0,
@@ -29,24 +28,22 @@ async def init_session():
         factor=1.5,
         exceptions={aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError, asyncio.TimeoutError}
     )
-    client_session = aiohttp.ClientSession(timeout=timeout)
+    # trust_env=True позволяет aiohttp корректно маршрутизировать запросы
+    client_session = aiohttp.ClientSession(timeout=timeout, trust_env=True)
     GLOBAL_SESSION = RetryClient(client_session=client_session, retry_options=retry_options)
-    logger.info("API Session initialized with retries")
+    logger.info("API Session initialized with extended timeouts")
 
 async def close_session():
-    """Корректное закрытие соединений HTTP-клиента при остановке бота."""
     global GLOBAL_SESSION
     if GLOBAL_SESSION:
         await GLOBAL_SESSION.close()
         logger.info("API Session closed")
 
 def _calculate_hash(data: list) -> str:
-    """Расчет контрольной суммы MD5 для фиксации изменений расписания."""
     dump = json.dumps(data, sort_keys=True).encode('utf-8')
     return hashlib.md5(dump).hexdigest()
 
 async def get_week_id(date_str: str) -> Optional[str]:
-    """Получение UUID учебной недели. При таймауте идет обход через прокси с ssl=False."""
     if not GLOBAL_SESSION:
         logger.error("Session not initialized!")
         return None
@@ -56,7 +53,7 @@ async def get_week_id(date_str: str) -> Optional[str]:
     # 1. Попытка прямого запроса
     try:
         logger.info(f"🔍 Запрос week_id для {date_str} (напрямую)...")
-        async with GLOBAL_SESSION.get(url, timeout=7) as resp:
+        async with GLOBAL_SESSION.get(url, timeout=10) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if isinstance(data, list) and len(data) > 0:
@@ -72,30 +69,32 @@ async def get_week_id(date_str: str) -> Optional[str]:
     except Exception as e:
         logger.warning(f"Прямой запрос week_id отвалился: {type(e).__name__} - {e}")
 
-    # 2. Резервная попытка через прокси (с отключенным SSL для избежания конфликтов сертификатов)
+    # 2. Резервная попытка через прокси
     if PROXY_URL:
         try:
             logger.info(f"🔄 Резервный запрос week_id через прокси ({PROXY_URL})...")
-            async with GLOBAL_SESSION.get(url, proxy=PROXY_URL, ssl=False, timeout=15) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        w_id = data[0].get('_id') or data[0].get('id')
-                        logger.info(f"✅ Найден week_id через прокси: {w_id}")
-                        return w_id
-                    elif isinstance(data, dict):
-                        w_id = data.get('_id') or data.get('id')
-                        logger.info(f"✅ Найден week_id через прокси: {w_id}")
-                        return w_id
-                else:
-                    logger.warning(f"Прокси-запрос вернул HTTP {resp.status}")
+            # Отключаем локальный резолвинг DNS, чтобы прокси сам искал sielom.ru
+            proxy_conn = aiohttp.TCPConnector(ssl=False, enable_cleanup_closed=True)
+            async with aiohttp.ClientSession(connector=proxy_conn, trust_env=True) as proxy_sess:
+                async with proxy_sess.get(url, proxy=PROXY_URL, timeout=20) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, list) and len(data) > 0:
+                            w_id = data[0].get('_id') or data[0].get('id')
+                            logger.info(f"✅ Найден week_id через прокси: {w_id}")
+                            return w_id
+                        elif isinstance(data, dict):
+                            w_id = data.get('_id') or data.get('id')
+                            logger.info(f"✅ Найден week_id через прокси: {w_id}")
+                            return w_id
+                    else:
+                        logger.warning(f"Прокси-запрос вернул HTTP {resp.status}")
         except Exception as e:
             logger.error(f"Запрос week_id через прокси также упал: {type(e).__name__} - {e}")
 
     return None
 
 async def fetch_schedule_raw(group_key: str, target_date: Optional[str] = None) -> Optional[List]:
-    """Запрос расписания группы с сайта колледжа."""
     if not GLOBAL_SESSION or group_key not in GROUPS_CONFIG:
         return None
     
@@ -116,8 +115,8 @@ async def fetch_schedule_raw(group_key: str, target_date: Optional[str] = None) 
 
     # 1. Прямой запрос
     try:
-        logger.info(f"📥 Запрос пар для группы {group_key} (напрямую)...")
-        async with GLOBAL_SESSION.get(url, params=params, timeout=10) as resp:
+        logger.info(f"📥 Запрос пар для {group_key} (напрямую)...")
+        async with GLOBAL_SESSION.get(url, params=params, timeout=12) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 result = data if isinstance(data, list) else data.get('data', data.get('items', []))
@@ -126,23 +125,24 @@ async def fetch_schedule_raw(group_key: str, target_date: Optional[str] = None) 
     except Exception as e:
         logger.warning(f"Прямой запрос уроков не удался: {type(e).__name__} - {e}")
 
-    # 2. Резерв через прокси (с ssl=False)
+    # 2. Резерв через прокси
     if PROXY_URL:
         try:
             logger.info(f"🔄 Резервный запрос уроков через прокси ({PROXY_URL})...")
-            async with GLOBAL_SESSION.get(url, params=params, proxy=PROXY_URL, ssl=False, timeout=15) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    result = data if isinstance(data, list) else data.get('data', data.get('items', []))
-                    logger.info(f"📦 Получено {len(result)} записей пар через прокси")
-                    return result
+            proxy_conn = aiohttp.TCPConnector(ssl=False, enable_cleanup_closed=True)
+            async with aiohttp.ClientSession(connector=proxy_conn, trust_env=True) as proxy_sess:
+                async with proxy_sess.get(url, params=params, proxy=PROXY_URL, timeout=25) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        result = data if isinstance(data, list) else data.get('data', data.get('items', []))
+                        logger.info(f"📦 Получено {len(result)} записей пар через прокси")
+                        return result
         except Exception as e:
             logger.error(f"Запрос уроков через прокси завершился ошибкой: {type(e).__name__} - {e}")
 
     return None
 
 def parse_lessons(raw_data: list, target_date: Optional[str] = None) -> list:
-    """Форматирование ответа: фильтрует день или отдает всю неделю."""
     lessons = []
     if not isinstance(raw_data, list):
         return lessons
