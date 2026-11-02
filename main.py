@@ -14,13 +14,19 @@ from utils.api_client import init_session, close_session
 from middlewares.throttling import ThrottlingMiddleware
 from handlers import admin, schedule, worker
 
-# Обработчик с мгновенным сбросом буфера на диск для tail -f
+# =====================================================================
+# НАСТРОЙКА ЛОГИРОВАНИЯ (МГНОВЕННЫЙ СБРОС БУФЕРА ДЛЯ TAIL -F)
+# =====================================================================
 class InstantRotatingFileHandler(RotatingFileHandler):
+    """
+    Кастомный файловый обработчик: принудительно вызывает flush()
+    после каждой записи, устраняя системную задержку буферизации.
+    """
     def emit(self, record):
         super().emit(record)
         self.flush()
 
-# Настройка ROOT-логгера: логи пишутся со всех модулей (handlers, utils, main)
+# Настраиваем корневой (ROOT) логгер, чтобы логи собирались со ВСЕХ файлов проекта
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 
@@ -36,17 +42,24 @@ root_logger.handlers.clear()
 root_logger.addHandler(file_handler)
 root_logger.addHandler(console_handler)
 
+# Снижаем шум сетевой библиотеки aiogram, чтобы не засорять логи
 logging.getLogger("aiogram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# =====================================================================
+# ИНИЦИАЛИЗАЦИЯ ДИСПЕТЧЕРА И МИДЛВАРЕЙ
+# =====================================================================
 dp = Dispatcher()
 dp.include_router(admin.router)
 dp.include_router(schedule.router)
 
-# Защита от флуда и спама кнопками (0.5 сек между запросами)
-dp.callback_query.middleware(ThrottlingMiddleware(rate_limit=0.5))
-dp.message.middleware(ThrottlingMiddleware(rate_limit=0.5))
+# Защита от спама кнопками: аргумент строго delay=0.1
+dp.callback_query.middleware(ThrottlingMiddleware(delay=0.1))
+dp.message.middleware(ThrottlingMiddleware(delay=0.1))
 
+# =====================================================================
+# СОБЫТИЯ ЖИЗНЕННОГО ЦИКЛА БОТА
+# =====================================================================
 async def on_startup(bot: Bot):
     logger.info("--- ЗАПУСК БОТА (PRO VERSION) ---")
     try:
@@ -55,7 +68,7 @@ async def on_startup(bot: Bot):
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook сброшен, БД и сессии готовы")
 
-        # Оповещение администратора о старте
+        # Оповещение администратора о старте без технических деталей о файлах логов
         if ADMIN_ID:
             try:
                 await bot.send_message(
@@ -64,9 +77,9 @@ async def on_startup(bot: Bot):
                     parse_mode="HTML"
                 )
             except Exception as e:
-                logger.warning(f"Не удалось уведомить админа: {e}")
+                logger.warning(f"Не удалось отправить уведомление админу: {e}")
 
-        # Фоновый воркер уведомлений о парах
+        # Фоновый воркер напоминаний о занятиях
         if hasattr(worker, 'notification_worker'):
             asyncio.create_task(worker.notification_worker(bot))
             logger.info("Задача worker запущена")
@@ -84,12 +97,15 @@ async def on_shutdown(bot: Bot):
         await close_session()
         await close_db_connection()
     except Exception as e:
-        logger.error(f"Ошибка закрытия сессий: {e}")
-    logger.info("Сессии закрыты")
+        logger.error(f"Ошибка закрытия внутренних сессий: {e}")
+    logger.info("Сессии закрыты штатно")
 
 dp.startup.register(on_startup)
 dp.shutdown.register(on_shutdown)
 
+# =====================================================================
+# ТОЧКА ВХОДА (MAIN)
+# =====================================================================
 async def main():
     session = None
     if PROXY_URL:
@@ -110,20 +126,20 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Остановка по Ctrl+C")
     except TelegramConflictError:
-        logger.error("❌ Конфликт: запущен дубликат бота с тем же токеном!")
+        logger.error("❌ Конфликт: запущен дубликат процесса бота!")
     except TelegramNetworkError as e:
         logger.error(f"❌ Сетевая ошибка Telegram: {e}")
     except Exception as e:
         logger.critical(f"Критическая ошибка: {e}", exc_info=True)
     finally:
-        # Закрываем только сессию aiohttp.
-        # Метод bot.close() НЕ вызываем, чтобы избежать бана Flood Control на 500+ секунд.
+        # ВАЖНО: Закрываем только локальную сессию aiohttp.
+        # Метод bot.close() НЕ вызываем, чтобы Telegram API не блокировал бота на 500+ секунд.
         try:
             if bot.session:
                 await bot.session.close()
-            logger.info("Сессия закрыта штатно")
+            logger.info("Сессия закрыта")
         except Exception as e:
-            logger.error(f"Ошибка закрытия сессии: {e}")
+            logger.error(f"Ошибка при закрытии сессии: {e}")
 
 if __name__ == "__main__":
     try:
