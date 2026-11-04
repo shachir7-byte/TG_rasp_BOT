@@ -29,6 +29,7 @@ LESSON_TIMES = {
 }
 
 GLOBAL_SESSION: Optional[RetryClient] = None
+# Кэш хранит расписание ПО НЕДЕЛЯМ (ключ: "group_key:YYYY-MM-DD_понедельника")
 SCHEDULE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def get_tz_now() -> datetime:
@@ -36,11 +37,11 @@ def get_tz_now() -> datetime:
 
 async def init_session():
     global GLOBAL_SESSION
-    timeout = aiohttp.ClientTimeout(total=45.0, connect=20.0)
+    timeout = aiohttp.ClientTimeout(total=40.0, connect=15.0)
     retry_options = ExponentialRetry(
         attempts=3,
         start_timeout=1.0,
-        max_timeout=15.0,
+        max_timeout=12.0,
         factor=1.5,
         exceptions={aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError, asyncio.TimeoutError}
     )
@@ -120,13 +121,14 @@ async def _v1_fetch_schedule(group_id: str, req_date: str) -> Optional[List]:
 
     return None
 
-def _v1_parse_lessons(raw_data: list, target_date: Optional[str]) -> list:
+def _v1_parse_lessons(raw_data: list) -> list:
     lessons = []
-    if not isinstance(raw_data, list): return lessons
+    if not isinstance(raw_data, list):
+        return lessons
 
     for item in raw_data:
-        if not isinstance(item, dict): continue
-        if target_date and item.get('date') != target_date: continue
+        if not isinstance(item, dict):
+            continue
         
         subj = item.get('subject', {}) or {}
         teach = item.get('teacher', {}) or {}
@@ -139,12 +141,15 @@ def _v1_parse_lessons(raw_data: list, target_date: Optional[str]) -> list:
         t_start, t_end = item.get('timeStart', ''), item.get('timeEnd', '')
         lessons.append({
             "time": f"{t_start}-{t_end}" if t_start and t_end else "??",
-            "time_start": t_start, "time_end": t_end,
-            "subject": s_name, "teacher": t_name, "room": r_num,
+            "time_start": t_start,
+            "time_end": t_end,
+            "subject": s_name,
+            "teacher": t_name,
+            "room": r_num,
             "lesson_number": item.get('lessonNumber', 99),
             "date": item.get('date', ''),
         })
-    lessons.sort(key=lambda x: x['lesson_number'])
+    lessons.sort(key=lambda x: (x['date'], x['lesson_number']))
     return lessons
 
 # =====================================================================
@@ -154,6 +159,7 @@ async def _v2_fetch_schedule(building_code: str, monday_str: str) -> Optional[Li
     url = f"{API_V2_URL}/{building_code}/"
     params = {"week": monday_str}
 
+    # 1. Прямой запрос (обычно работает мгновенно и без прокси)
     try:
         async with GLOBAL_SESSION.get(url, params=params, timeout=12) as resp:
             if resp.status == 200:
@@ -162,6 +168,7 @@ async def _v2_fetch_schedule(building_code: str, monday_str: str) -> Optional[Li
     except Exception as e:
         logger.warning(f"V2: Прямой запрос пар ({building_code}) не удался: {e}")
 
+    # 2. Резервный запрос через прокси
     if PROXY_URL:
         try:
             proxy_conn = aiohttp.TCPConnector(ssl=False, enable_cleanup_closed=True)
@@ -175,20 +182,29 @@ async def _v2_fetch_schedule(building_code: str, monday_str: str) -> Optional[Li
 
     return None
 
-def _v2_parse_lessons(raw_data: list, group_name: str, target_date: Optional[str]) -> list:
+def _v2_parse_lessons(raw_data: list, group_name: str) -> list:
     lessons = []
-    if not isinstance(raw_data, list): return lessons
+    if not isinstance(raw_data, list):
+        return lessons
+
+    # Нормализуем имя группы для надежного сравнения (убираем лишние пробелы и дефисы)
+    norm_target_group = group_name.replace("-", " ").replace("  ", " ").strip().upper()
 
     for item in raw_data:
-        if not isinstance(item, list) or len(item) < 7: continue
+        if not isinstance(item, list) or len(item) < 7:
+            continue
         
-        item_group, item_date = str(item[0]).strip(), str(item[1]).strip()
+        item_group_raw = str(item[0]).replace("-", " ").replace("  ", " ").strip().upper()
+        item_date = str(item[1]).strip()
         
-        if item_group != group_name: continue
-        if target_date and item_date != target_date: continue
+        if item_group_raw != norm_target_group:
+            continue
             
         lesson_num = int(item[2]) if str(item[2]).isdigit() else 99
-        subgroup, subject, cabinet, teacher = item[3], str(item[4]).strip(), str(item[5]).strip(), str(item[6]).strip()
+        subgroup = item[3]
+        subject = str(item[4]).strip()
+        cabinet = str(item[5]).strip()
+        teacher = str(item[6]).strip()
         
         times = LESSON_TIMES.get(lesson_num, {"start": "", "end": ""})
         t_start, t_end = times["start"], times["end"]
@@ -198,83 +214,103 @@ def _v2_parse_lessons(raw_data: list, group_name: str, target_date: Optional[str
 
         lessons.append({
             "time": f"{t_start}-{t_end}" if t_start and t_end else "??",
-            "time_start": t_start, "time_end": t_end,
-            "subject": subject, "teacher": teacher, "room": cabinet,
-            "lesson_number": lesson_num, "date": item_date,
+            "time_start": t_start,
+            "time_end": t_end,
+            "subject": subject,
+            "teacher": teacher,
+            "room": cabinet,
+            "lesson_number": lesson_num,
+            "date": item_date,
         })
     
-    lessons.sort(key=lambda x: x['lesson_number'])
+    lessons.sort(key=lambda x: (x['date'], x['lesson_number']))
     return lessons
 
 # =====================================================================
-# ГЛАВНЫЙ ИНТЕРФЕЙС
+# ГЛАВНЫЙ ИНТЕРФЕЙС (С УМНЫМ НЕДЕЛЬНЫМ КЭШИРОВАНИЕМ)
 # =====================================================================
 async def get_schedule(group_key: str, target_date: Optional[str] = None, force_refresh: bool = False, is_week: bool = False) -> Tuple[Optional[List], bool]:
+    """
+    Кэширует сразу всю учебную неделю по дате понедельника.
+    Запросы отдельных дней мгновенно фильтруются из недельного кэша без обращения к сети.
+    """
     if not GLOBAL_SESSION or group_key not in GROUPS_CONFIG:
         return None, False
 
-    mode = "week" if is_week else "day"
-    cache_key = f"{group_key}:{target_date or 'today'}:{mode}"
+    # 1. Вычисляем опорную дату и понедельник этой недели
+    req_date = target_date if target_date else get_tz_now().strftime("%Y-%m-%d")
+    if not target_date and get_tz_now().weekday() == 6:
+        next_mon = get_tz_now() + timedelta(days=1)
+        req_date = next_mon.strftime("%Y-%m-%d")
+
+    dt = datetime.strptime(req_date, "%Y-%m-%d")
+    monday_dt = dt - timedelta(days=dt.weekday())
+    monday_str = monday_dt.strftime("%Y-%m-%d")
+
+    # Единый ключ кэша для всей недели (и для кнопки "Неделя", и для кнопок "Пн"-"Сб")
+    cache_key = f"{group_key}:{monday_str}"
     now_ts = datetime.now().timestamp()
     
-    # 1. Проверка кэша
+    week_lessons = None
+    changes_detected = False
+
+    # 2. Проверяем, есть ли свежая неделя в кэше
     if not force_refresh and cache_key in SCHEDULE_CACHE:
         entry = SCHEDULE_CACHE[cache_key]
         if now_ts - entry['timestamp'] < CACHE_TTL_SECONDS:
-            logger.info(f"⚡ Кэш HIT ({cache_key})")
-            return entry['data'], False
+            logger.debug(f"⚡ Кэш HIT ({cache_key})")
+            week_lessons = entry['data']
         else:
             del SCHEDULE_CACHE[cache_key]
 
-    # 2. Вычисление базовых дат
-    req_date = target_date if target_date else get_tz_now().strftime("%Y-%m-%d")
-    if not target_date and get_tz_now().weekday() == 6:
-        next_mon = get_tz_now() + timedelta(days=(7 - get_tz_now().weekday()))
-        req_date = next_mon.strftime("%Y-%m-%d")
+    # 3. Если в кэше нет или нажата кнопка "Обновить" — качаем с сайта
+    if week_lessons is None:
+        if API_VERSION == 1:
+            group_id = GROUPS_CONFIG[group_key]['id']
+            raw_data = await _v1_fetch_schedule(group_id, monday_str)
+            if raw_data is not None:
+                week_lessons = _v1_parse_lessons(raw_data)
+        elif API_VERSION == 2:
+            group_name = GROUPS_CONFIG[group_key]['name']
+            building_code = "b5" if "Д 23" in group_name or "ГД" in group_name else "b7"
+            raw_data = await _v2_fetch_schedule(building_code, monday_str)
+            if raw_data is not None:
+                week_lessons = _v2_parse_lessons(raw_data, group_name)
+        else:
+            logger.error(f"Неизвестная версия API: {API_VERSION}")
+            return None, False
 
-    filter_date = None if is_week else req_date
-    parsed_data = []
+        # Если сеть упала, пытаемся отдать старый кэш (если он был)
+        if week_lessons is None:
+            logger.error(f"❌ Сбой сети: API v{API_VERSION} не вернуло данные для {cache_key}")
+            fallback = SCHEDULE_CACHE.get(cache_key, {}).get('data')
+            if fallback is not None:
+                week_lessons = fallback
+            else:
+                return None, False
+        else:
+            # Считаем хеш всей недели и обновляем кэш
+            new_hash = _calculate_hash(week_lessons)
+            if cache_key in SCHEDULE_CACHE and SCHEDULE_CACHE[cache_key].get('hash') != new_hash:
+                changes_detected = True
+                logger.info(f"🔔 ОБНАРУЖЕНЫ ИЗМЕНЕНИЯ РАСПИСАНИЯ для {cache_key}!")
+            
+            SCHEDULE_CACHE[cache_key] = {
+                'data': week_lessons,
+                'timestamp': now_ts,
+                'hash': new_hash
+            }
+            logger.info(f"💾 Закэширована вся неделя ({len(week_lessons)} пар) для {cache_key} (API v{API_VERSION})")
 
-    # 3. Маршрутизация запроса в зависимости от версии API
-    if API_VERSION == 1:
-        group_id = GROUPS_CONFIG[group_key]['id']
-        raw_data = await _v1_fetch_schedule(group_id, req_date)
-        if raw_data is None:
-            return SCHEDULE_CACHE.get(cache_key, {}).get('data'), False
-        parsed_data = _v1_parse_lessons(raw_data, filter_date)
-
-    elif API_VERSION == 2:
-        group_name = GROUPS_CONFIG[group_key]['name']
-        # Простая логика определения корпуса (можно расширить при добавлении новых групп)
-        building_code = "b5" if "Д 23" in group_name or "ГД" in group_name else "b7"
-        
-        # Для V2 нужна дата понедельника
-        dt = datetime.strptime(req_date, "%Y-%m-%d")
-        monday = dt - timedelta(days=dt.weekday())
-        
-        raw_data = await _v2_fetch_schedule(building_code, monday.strftime("%Y-%m-%d"))
-        if raw_data is None:
-            return SCHEDULE_CACHE.get(cache_key, {}).get('data'), False
-        parsed_data = _v2_parse_lessons(raw_data, group_name, filter_date)
-
+    # 4. Отдаем либо всю неделю, либо мгновенно вырезаем запрошенный день
+    if is_week:
+        return week_lessons, changes_detected
     else:
-        logger.error(f"Неизвестная версия API: {API_VERSION}")
-        return None, False
-    
-    # 4. Проверка хеша и сохранение
-    new_hash = _calculate_hash(parsed_data)
-    changes_detected = False
-    
-    if cache_key in SCHEDULE_CACHE and SCHEDULE_CACHE[cache_key].get('hash') != new_hash:
-        changes_detected = True
-        logger.info(f"🔔 ОБНАРУЖЕНЫ ИЗМЕНЕНИЯ РАСПИСАНИЯ для {cache_key}!")
-    
-    SCHEDULE_CACHE[cache_key] = {'data': parsed_data, 'timestamp': now_ts, 'hash': new_hash}
-    logger.info(f"💾 Закэшировано {len(parsed_data)} пар для {cache_key} (v{API_VERSION})")
-    
-    return parsed_data, changes_detected
+        day_lessons = [l for l in week_lessons if l.get('date') == req_date]
+        return day_lessons, changes_detected
 
 async def invalidate_cache_for_group(group_key: str):
     keys_to_delete = [k for k in SCHEDULE_CACHE.keys() if k.startswith(f"{group_key}:")]
     for k in keys_to_delete:
         del SCHEDULE_CACHE[k]
+    logger.info(f"Кэш сброшен для группы {group_key}")

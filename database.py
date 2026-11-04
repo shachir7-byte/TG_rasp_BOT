@@ -1,186 +1,235 @@
 import aiosqlite
-from datetime import datetime, timezone, timedelta
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Tuple, Dict, Any
+
 from config import LOCAL_TIMEZONE_OFFSET, DEFAULT_GROUP, GROUPS_CONFIG
 
-DB_FILE = "schedule.db"
-TZ = timezone(timedelta(hours=LOCAL_TIMEZONE_OFFSET))
+logger = logging.getLogger(__name__)
 
-_db_connection: aiosqlite.Connection = None
+DB_PATH = "schedule.db"
+LOCAL_TZ = timezone(timedelta(hours=LOCAL_TIMEZONE_OFFSET))
 
-async def get_db_connection() -> aiosqlite.Connection:
-    global _db_connection
-    if _db_connection is None:
-        _db_connection = await aiosqlite.connect(DB_FILE)
-        await _db_connection.execute("PRAGMA journal_mode=WAL")
-    return _db_connection
+# Глобальное соединение с БД (открывается один раз при старте бота для скорости)
+_db_conn: Optional[aiosqlite.Connection] = None
 
-async def close_db_connection():
-    global _db_connection
-    if _db_connection:
-        await _db_connection.close()
-        _db_connection = None
+async def get_db() -> aiosqlite.Connection:
+    """Возвращает активное соединение с БД или создает новое с оптимизацией WAL."""
+    global _db_conn
+    if _db_conn is None:
+        _db_conn = await aiosqlite.connect(DB_PATH)
+        # Включаем WAL-режим: запись и чтение не блокируют друг друга и не нагружают диск
+        await _db_conn.execute("PRAGMA journal_mode=WAL;")
+        await _db_conn.execute("PRAGMA synchronous=NORMAL;")
+    return _db_conn
 
 async def init_db():
-    db = await get_db_connection()
+    """Инициализация таблиц базы данных при старте бота."""
+    db = await get_db()
     
+    # Таблица пользователей и их настроек уведомлений
     await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             chat_id INTEGER PRIMARY KEY,
             username TEXT,
-            user_group TEXT DEFAULT 'is',
-            notify_time TEXT,
-            notify_type TEXT DEFAULT 'time',
+            group_key TEXT DEFAULT 'is',
+            notify_time TEXT DEFAULT NULL,
+            notify_type TEXT DEFAULT 'none',
             notify_offset INTEGER DEFAULT 0,
-            notify_restart INTEGER DEFAULT 0,
-            request_count INTEGER DEFAULT 0,
-            last_sent_date TEXT,
-            first_seen TEXT
+            notify_updates INTEGER DEFAULT 1,
+            last_sent TEXT DEFAULT NULL,
+            requests_count INTEGER DEFAULT 0
         )
     """)
     
+    # Таблица логов действий для статистики
     await db.execute("""
-        CREATE TABLE IF NOT EXISTS stats (
+        CREATE TABLE IF NOT EXISTS action_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER,
             action TEXT,
             timestamp TEXT
         )
     """)
-    
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS groups_config (
-            key TEXT PRIMARY KEY,
-            name TEXT,
-            group_id TEXT
-        )
-    """)
-
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_user_group ON users(user_group)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_stats_chat ON stats(chat_id)")
-
-    for key, data in GROUPS_CONFIG.items():
-        await db.execute(
-            "INSERT OR IGNORE INTO groups_config (key, name, group_id) VALUES (?, ?, ?)",
-            (key, data['name'], data['id'])
-        )
-    
     await db.commit()
+    logger.info("Database initialized (WAL mode enabled)")
 
-async def save_user(chat_id: int, username: str = None, group: str = DEFAULT_GROUP):
-    db = await get_db_connection()
-    now = datetime.now(TZ).isoformat()
-    await db.execute(
-        "INSERT OR IGNORE INTO users (chat_id, username, user_group, first_seen, request_count) VALUES (?, ?, ?, ?, 0)",
-        (chat_id, username, group, now)
-    )
-    await db.execute(
-        "UPDATE users SET username = COALESCE(?, username), user_group = COALESCE(?, user_group) WHERE chat_id = ?",
-        (username, group, chat_id)
-    )
+async def close_db_connection():
+    """Корректное закрытие соединения с БД при остановке бота."""
+    global _db_conn
+    if _db_conn is not None:
+        await _db_conn.close()
+        _db_conn = None
+        logger.info("Database connection closed")
+
+async def get_groups_config() -> Dict[str, Any]:
+    """Возвращает словарь конфигурации групп."""
+    return GROUPS_CONFIG
+
+async def save_user(chat_id: int, username: Optional[str], group_key: str = DEFAULT_GROUP):
+    """Сохраняет нового пользователя или обновляет его группу и username."""
+    db = await get_db()
+    uname = username or "unknown"
+    await db.execute("""
+        INSERT INTO users (chat_id, username, group_key)
+        VALUES (?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            username = excluded.username,
+            group_key = excluded.group_key
+    """, (chat_id, uname, group_key))
     await db.commit()
 
 async def get_user_group(chat_id: int) -> str:
-    db = await get_db_connection()
-    async with db.execute("SELECT user_group FROM users WHERE chat_id = ?", (chat_id,)) as cursor:
+    """Получает ключ группы пользователя (по умолчанию 'is')."""
+    db = await get_db()
+    async with db.execute("SELECT group_key FROM users WHERE chat_id = ?", (chat_id,)) as cursor:
         row = await cursor.fetchone()
-        return row[0] if row else DEFAULT_GROUP
+        if row and row[0] in GROUPS_CONFIG:
+            return row[0]
+    return DEFAULT_GROUP
 
-async def get_user_settings(chat_id: int):
-    db = await get_db_connection()
-    async with db.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,)) as cursor:
+async def get_user_settings(chat_id: int) -> Optional[Tuple]:
+    """
+    Возвращает кортеж настроек пользователя:
+    (chat_id, username, group_key, notify_time, notify_type, notify_offset, notify_updates, last_sent, requests_count)
+    """
+    db = await get_db()
+    async with db.execute("""
+        SELECT chat_id, username, group_key, notify_time, notify_type, notify_offset, notify_updates, last_sent, requests_count
+        FROM users WHERE chat_id = ?
+    """, (chat_id,)) as cursor:
         return await cursor.fetchone()
 
-async def update_notify_settings(chat_id: int, time: str = None, n_type: str = 'time', offset: int = 0, restart: int = 0):
-    db = await get_db_connection()
-    await db.execute(
-        "UPDATE users SET notify_time = ?, notify_type = ?, notify_offset = ?, notify_restart = ? WHERE chat_id = ?",
-        (time, n_type, offset, restart, chat_id)
-    )
+async def update_notify_settings(chat_id: int, time: Optional[str], n_type: str, offset: int):
+    """Обновляет настройки уведомлений пользователя и сбрасывает маркер last_sent."""
+    db = await get_db()
+    await db.execute("""
+        UPDATE users
+        SET notify_time = ?, notify_type = ?, notify_offset = ?, last_sent = NULL
+        WHERE chat_id = ?
+    """, (time, n_type, offset, chat_id))
     await db.commit()
 
 async def cancel_notify(chat_id: int):
-    db = await get_db_connection()
-    await db.execute(
-        "UPDATE users SET notify_time = NULL, notify_type = 'time', notify_offset = 0 WHERE chat_id = ?",
-        (chat_id,)
-    )
+    """Отключает уведомления для пользователя."""
+    db = await get_db()
+    await db.execute("""
+        UPDATE users
+        SET notify_time = NULL, notify_type = 'none', notify_offset = 0
+        WHERE chat_id = ?
+    """, (chat_id,))
     await db.commit()
 
 async def increment_request_count(chat_id: int):
-    db = await get_db_connection()
-    await db.execute("UPDATE users SET request_count = request_count + 1 WHERE chat_id = ?", (chat_id,))
+    """Увеличивает счетчик запросов расписания пользователя."""
+    db = await get_db()
+    await db.execute("""
+        UPDATE users SET requests_count = requests_count + 1 WHERE chat_id = ?
+    """, (chat_id,))
     await db.commit()
 
-async def update_last_sent(chat_id: int, date_str: str):
-    db = await get_db_connection()
-    await db.execute("UPDATE users SET last_sent_date = ? WHERE chat_id = ?", (date_str, chat_id))
+async def log_action(chat_id: int, action: str):
+    """Записывает действие пользователя в таблицу статистики."""
+    db = await get_db()
+    now_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute("""
+        INSERT INTO action_logs (chat_id, action, timestamp)
+        VALUES (?, ?, ?)
+    """, (chat_id, action, now_str))
     await db.commit()
 
-async def get_active_users_for_worker():
-    db = await get_db_connection()
-    async with db.execute("""
-        SELECT chat_id, notify_time, notify_type, notify_offset, last_sent_date, user_group 
-        FROM users 
-        WHERE notify_time IS NOT NULL OR (notify_type = 'offset' AND notify_offset > 0)
-    """) as cursor:
+async def get_all_users() -> List[Tuple]:
+    """Возвращает список всех пользователей из БД."""
+    db = await get_db()
+    async with db.execute("SELECT chat_id, username, group_key, requests_count FROM users") as cursor:
         return await cursor.fetchall()
 
-async def get_all_users():
-    db = await get_db_connection()
-    async with db.execute("SELECT chat_id, username, user_group FROM users") as cursor:
-        return await cursor.fetchall()
-
-async def get_all_users_chat_ids():
-    db = await get_db_connection()
+async def get_all_users_chat_ids() -> List[int]:
+    """Возвращает список только chat_id всех пользователей (для рассылок)."""
+    db = await get_db()
     async with db.execute("SELECT chat_id FROM users") as cursor:
         rows = await cursor.fetchall()
         return [r[0] for r in rows]
 
 async def get_user_count() -> int:
-    db = await get_db_connection()
+    """Возвращает общее количество пользователей."""
+    db = await get_db()
     async with db.execute("SELECT COUNT(*) FROM users") as cursor:
         row = await cursor.fetchone()
         return row[0] if row else 0
 
-async def get_groups_config():
-    db = await get_db_connection()
-    async with db.execute("SELECT key, name, group_id FROM groups_config") as cursor:
-        rows = await cursor.fetchall()
-        return {r[0]: {"name": r[1], "group_id": r[2]} for r in rows}
-
-async def log_action(chat_id: int, action: str):
-    db = await get_db_connection()
-    await db.execute(
-        "INSERT INTO stats (chat_id, action, timestamp) VALUES (?, ?, ?)",
-        (chat_id, action, datetime.now(TZ).isoformat())
-    )
-    await db.commit()
-
-async def get_full_admin_stats():
-    db = await get_db_connection()
-    groups = await get_groups_config()
+async def get_active_users_for_worker() -> List[Tuple]:
+    """Возвращает пользователей с включенными уведомлениями для фонового воркера."""
+    db = await get_db()
     async with db.execute("""
-        SELECT u.chat_id, u.username, u.user_group, u.request_count, u.first_seen,
-               (SELECT s.action FROM stats s WHERE s.chat_id = u.chat_id ORDER BY s.timestamp DESC LIMIT 1) as last_act
-        FROM users u ORDER BY u.request_count DESC
+        SELECT chat_id, notify_time, notify_type, notify_offset, last_sent, group_key
+        FROM users
+        WHERE notify_type IN ('time', 'offset')
     """) as cursor:
-        users = await cursor.fetchall()
+        return await cursor.fetchall()
 
-    total_users = len(users)
-    total_requests = sum(u[3] for u in users)
-    lines = [f"📊 <b>Полная статистика</b>\n\n👥 Всего: <b>{total_users}</b>", f"📈 Запросов: <b>{total_requests}</b>\n━━━━━━━━━━━━━━━━━━━━━━\n"]
-
-    for chat_id, username, grp, count, first_seen, last_act in users:
-        name = f"@{username}" if username else f"User {chat_id}"
-        grp_name = groups.get(grp, {}).get('name', grp)
-        act_info = f"<i>{last_act}</i>" if last_act else "—"
-        lines.append(f"🆔 <code>{chat_id}</code> | <b>{name}</b> ({grp_name})\n   └ Запросов: {count} | Активность: {act_info}\n")
-
-    return "\n".join(lines)
+async def update_last_sent(chat_id: int, date_str: str):
+    """Отмечает дату последней отправки уведомления, чтобы не слать дубли в один день."""
+    db = await get_db()
+    await db.execute("UPDATE users SET last_sent = ? WHERE chat_id = ?", (date_str, chat_id))
+    await db.commit()
 
 async def clear_stats():
-    db = await get_db_connection()
-    await db.execute("DELETE FROM stats")
-    deleted = db.total_changes
+    """Очищает старые логи действий (вызывается воркером раз в сутки для экономии места)."""
+    db = await get_db()
+    await db.execute("DELETE FROM action_logs")
     await db.commit()
-    return deleted
+
+async def get_logs(limit: int = 2000) -> List[Tuple]:
+    """Возвращает последние записи логов."""
+    db = await get_db()
+    async with db.execute("SELECT id, chat_id, action, timestamp FROM action_logs ORDER BY id DESC LIMIT ?", (limit,)) as cursor:
+        return await cursor.fetchall()
+
+async def get_full_admin_stats() -> str:
+    """Формирует полный текстовый отчет со статистикой для админ-панели."""
+    db = await get_db()
+    
+    # 1. Количество пользователей и распределение по группам
+    async with db.execute("SELECT group_key, COUNT(*) FROM users GROUP BY group_key") as cursor:
+        group_rows = await cursor.fetchall()
+        
+    total_users = sum(r[1] for r in group_rows)
+    
+    # 2. Количество активных подписок на уведомления
+    async with db.execute("SELECT COUNT(*) FROM users WHERE notify_type != 'none'") as cursor:
+        notify_row = await cursor.fetchone()
+        notify_count = notify_row[0] if notify_row else 0
+
+    # 3. Топ-5 активных пользователей
+    async with db.execute("SELECT username, group_key, requests_count FROM users ORDER BY requests_count DESC LIMIT 5") as cursor:
+        top_users = await cursor.fetchall()
+
+    # 4. Топ-5 популярных кнопок за сегодня
+    async with db.execute("SELECT action, COUNT(*) as cnt FROM action_logs GROUP BY action ORDER BY cnt DESC LIMIT 5") as cursor:
+        top_actions = await cursor.fetchall()
+
+    lines = [
+        "📊 <b>Статистика бота</b>",
+        "──────────────────────────",
+        f"👥 <b>Всего пользователей:</b> <code>{total_users}</code>",
+        f"🔔 <b>С уведомлениями:</b> <code>{notify_count}</code>\n",
+        "📚 <b>По группам:</b>"
+    ]
+    
+    for g_key, cnt in group_rows:
+        g_name = GROUPS_CONFIG.get(g_key, {}).get('name', g_key)
+        lines.append(f" • {g_name}: <code>{cnt}</code>")
+
+    if top_users:
+        lines.append("\n🏆 <b>Топ-5 активных пользователей:</b>")
+        for uname, g_key, reqs in top_users:
+            tag = f"@{uname}" if uname and uname != "unknown" else "Без ника"
+            lines.append(f" • {tag} ({g_key.upper()}): <code>{reqs}</code> запр.")
+
+    if top_actions:
+        lines.append("\n🔥 <b>Популярные действия за сутки:</b>")
+        for act, cnt in top_actions:
+            lines.append(f" • <code>{act}</code>: {cnt}")
+
+    return "\n".join(lines)

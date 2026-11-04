@@ -49,8 +49,8 @@ def get_week_bounds(now_dt: datetime, shift_weeks: int = 0):
 
 def get_group_select_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📚 ИС-23/9-3", callback_data="group_is")],
-        [InlineKeyboardButton(text="🎨 Д-23/9-1", callback_data="group_d")]
+        [InlineKeyboardButton(text="📚 ИС 23/9-3", callback_data="group_is")],
+        [InlineKeyboardButton(text="🎨 Д 23/9-1", callback_data="group_d")]
     ])
 
 def get_main_keyboard(chat_id: int = None):
@@ -95,7 +95,7 @@ def get_main_keyboard(chat_id: int = None):
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_schedule_nav_keyboard(current_action: str):
+def get_schedule_nav_keyboard(current_action: str, is_week: bool):
     today = datetime.now(LOCAL_TZ)
     curr_mon, curr_sat = get_week_bounds(today, shift_weeks=0)
     next_mon, next_sat = get_week_bounds(today, shift_weeks=1)
@@ -104,16 +104,18 @@ def get_schedule_nav_keyboard(current_action: str):
     next_str = f"{next_mon.strftime('%d.%m')} - {next_sat.strftime('%d.%m')}"
 
     keyboard = []
-    if current_action == "sch_week":
-        keyboard.append([
-            InlineKeyboardButton(text=f"📆 След. неделя ({next_str}) ❯", callback_data="sch_next_week")
-        ])
-    elif current_action == "sch_next_week":
-        keyboard.append([
-            InlineKeyboardButton(text=f"❮ 📆 Тек. неделя ({curr_str})", callback_data="sch_week")
-        ])
+    if is_week:
+        if current_action == "sch_week":
+            keyboard.append([
+                InlineKeyboardButton(text=f"📆 След. неделя ({next_str}) ❯", callback_data="sch_next_week")
+            ])
+        elif current_action == "sch_next_week":
+            keyboard.append([
+                InlineKeyboardButton(text=f"❮ 📆 Тек. неделя ({curr_str})", callback_data="sch_week")
+            ])
 
-    keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=current_action)])
+    # Кнопка "Обновить" передает префикс sch_refresh_, чтобы принудительно обновить кэш с сайта
+    keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sch_refresh_{current_action}")])
     keyboard.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
 
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -167,7 +169,8 @@ def get_cancel_kb():
 async def cmd_start(m: types.Message, state: FSMContext):
     await state.clear()
     logger.info(f"👤 Команда /start от [{m.chat.id}|@{m.from_user.username}]")
-    await save_user(m.chat.id, m.from_user.username, 'is')
+    user_group = await get_user_group(m.chat.id)
+    await save_user(m.chat.id, m.from_user.username, user_group)
     await log_action(m.chat.id, "start")
     kb = get_main_keyboard(m.chat.id)
     await m.answer("👋 <b>Привет! Я бот-расписание</b>\n\nВыберите группу или день:", reply_markup=kb, parse_mode="HTML")
@@ -243,15 +246,23 @@ async def handle_change_group(c: types.CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("sch_"))
 async def handle_schedule(c: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    action = c.data
+    raw_action = c.data
     user_id = c.from_user.id
     username = c.from_user.username or "no_user"
     
-    logger.info(f"👉 КЛИК КНОПКИ: '{action}' от [{user_id}|@{username}]")
+    # Проверяем, нажата ли кнопка принудительного обновления
+    force_refresh = False
+    if raw_action.startswith("sch_refresh_"):
+        force_refresh = True
+        action = raw_action.replace("sch_refresh_", "")
+    else:
+        action = raw_action
+
+    logger.info(f"👉 КЛИК КНОПКИ: '{raw_action}' от [{user_id}|@{username}]")
     
     user_group = await get_user_group(user_id)
     await increment_request_count(user_id)
-    await log_action(user_id, action)
+    await log_action(user_id, raw_action)
     
     target_date = None
     title = ""
@@ -284,31 +295,31 @@ async def handle_schedule(c: types.CallbackQuery, state: FSMContext):
             title = target_date
 
     try:
-        await c.answer("⏳ Загрузка...")
+        toast_text = "🔄 Обновляю с сайта..." if force_refresh else "⏳ Загрузка..."
+        await c.answer(toast_text)
     except Exception:
         pass
     
     try:
-        logger.info(f"⏳ Запрос расписания для '{user_group}' (дата: {target_date}, is_week={is_week})...")
-        lessons, changes = await get_schedule(user_group, target_date=target_date, is_week=is_week)
+        lessons, changes = await get_schedule(
+            user_group,
+            target_date=target_date,
+            force_refresh=force_refresh,
+            is_week=is_week
+        )
         
         if lessons is None:
             text = (
-                "⚠️ <b>Сервер колледжа временно перегружен</b>\n\n"
-                "Сайт sielom.ru не ответил вовремя. Нажмите «🔄 Обновить» через пару секунд."
+                "⚠️ <b>Сервер расписания временно недоступен</b>\n\n"
+                "Сайт колледжа не ответил вовремя. Нажмите «🔄 Обновить» через пару секунд."
             )
         else:
-            logger.info(f"📄 Форматирование: найдено {len(lessons)} пар")
             text = format_schedule_text(title, lessons, is_week, datetime.now(LOCAL_TZ))
         
-        kb = get_schedule_nav_keyboard(action) if is_week else InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Обновить", callback_data=action)],
-            [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
-        ])
+        kb = get_schedule_nav_keyboard(action, is_week)
         
         try:
             await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-            logger.info(f"✅ Сообщение обновлено для [{user_id}]")
         except Exception as e:
             if "message is not modified" not in str(e):
                 logger.warning(f"edit_text не сработал ({e}), отправляем новым сообщением")

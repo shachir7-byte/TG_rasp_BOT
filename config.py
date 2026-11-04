@@ -1,7 +1,11 @@
 import os
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Время старта бота для расчета Uptime в админ-панели
+START_TIME = time.time()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID")) if os.getenv("ADMIN_ID") else 0
