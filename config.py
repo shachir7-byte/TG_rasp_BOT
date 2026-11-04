@@ -11,9 +11,18 @@ LOCAL_TIMEZONE_OFFSET = 5
 DEFAULT_GROUP = "is"
 CACHE_TTL_SECONDS = 1800
 
+# ==========================================
+# ТУМБЛЕР ВЕРСИИ API
+# 1 = Старый сайт (sielom.ru) - Требует week_id
+# 2 = Новый сайт (sielom-web.ru) - Прямой запрос
+# ==========================================
+API_VERSION = 2
+
+# Конфигурация групп
+# ВАЖНО: 'name' должно строго совпадать с тем, что отдает sielom-web.ru (без тире)
 GROUPS_CONFIG = {
-    "is": {"name": "ИС-23/9-3", "id": "f7fab01c-26fa-11ee-9f9a-c08a77b51a65"},
-    "d": {"name": "Д-23/9-1", "id": "c7b0c54e-38d4-11ee-9f9a-c08a77b51a65"}
+    "is": {"name": "ИС 23/9-3", "id": "f7fab01c-26fa-11ee-9f9a-c08a77b51a65"},
+    "d": {"name": "Д 23/9-1", "id": "c7b0c54e-38d4-11ee-9f9a-c08a77b51a65"}
 }
 
 if not BOT_TOKEN:
