@@ -24,10 +24,13 @@ async def get_db() -> aiosqlite.Connection:
     return _db_conn
 
 async def init_db():
-    """Инициализация таблиц базы данных при старте бота."""
+    """
+    Инициализация таблиц базы данных и автоматическая миграция старой схемы.
+    Гарантирует наличие всех нужных колонок без потери существующих пользователей.
+    """
     db = await get_db()
     
-    # Таблица пользователей и их настроек уведомлений
+    # 1. Базовое создание таблицы пользователей (если файла БД еще не было)
     await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             chat_id INTEGER PRIMARY KEY,
@@ -42,7 +45,40 @@ async def init_db():
         )
     """)
     
-    # Таблица логов действий для статистики
+    # 2. АВТО-МИГРАЦИЯ: проверяем реальные колонки в существующей таблице users
+    async with db.execute("PRAGMA table_info(users);") as cursor:
+        columns_info = await cursor.fetchall()
+        existing_columns = {col[1] for col in columns_info}
+
+    # Список всех необходимых колонок и их определений
+    required_columns = {
+        "username": "TEXT",
+        "group_key": f"TEXT DEFAULT '{DEFAULT_GROUP}'",
+        "notify_time": "TEXT DEFAULT NULL",
+        "notify_type": "TEXT DEFAULT 'none'",
+        "notify_offset": "INTEGER DEFAULT 0",
+        "notify_updates": "INTEGER DEFAULT 1",
+        "last_sent": "TEXT DEFAULT NULL",
+        "requests_count": "INTEGER DEFAULT 0"
+    }
+
+    # Докидываем недостающие колонки на лету
+    for col_name, col_def in required_columns.items():
+        if col_name not in existing_columns:
+            logger.info(f"🛠 Авто-миграция БД: добавляю недостающую колонку '{col_name}' в таблицу users")
+            await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def};")
+
+    # Если в старой БД колонка группы называлась 'user_group' или 'group_id', переносим данные в 'group_key'
+    if "user_group" in existing_columns:
+        await db.execute("UPDATE users SET group_key = user_group WHERE group_key IS NULL OR group_key = '';")
+    elif "group_id" in existing_columns:
+        await db.execute("UPDATE users SET group_key = group_id WHERE group_key IS NULL OR group_key = '';")
+
+    # Если в старой БД счетчик назывался 'request_count', переносим данные в 'requests_count'
+    if "request_count" in existing_columns:
+        await db.execute("UPDATE users SET requests_count = request_count WHERE requests_count = 0 AND request_count > 0;")
+
+    # 3. Таблица логов действий для статистики
     await db.execute("""
         CREATE TABLE IF NOT EXISTS action_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,8 +87,15 @@ async def init_db():
             timestamp TEXT
         )
     """)
+    
+    # Проверяем наличие колонок в action_logs на случай старой структуры
+    async with db.execute("PRAGMA table_info(action_logs);") as cursor:
+        log_cols = {col[1] for col in await cursor.fetchall()}
+    if "timestamp" not in log_cols:
+        await db.execute("ALTER TABLE action_logs ADD COLUMN timestamp TEXT;")
+
     await db.commit()
-    logger.info("Database initialized (WAL mode enabled)")
+    logger.info("Database initialized and verified (WAL mode enabled)")
 
 async def close_db_connection():
     """Корректное закрытие соединения с БД при остановке бота."""
@@ -225,7 +268,8 @@ async def get_full_admin_stats() -> str:
         lines.append("\n🏆 <b>Топ-5 активных пользователей:</b>")
         for uname, g_key, reqs in top_users:
             tag = f"@{uname}" if uname and uname != "unknown" else "Без ника"
-            lines.append(f" • {tag} ({g_key.upper()}): <code>{reqs}</code> запр.")
+            g_str = (g_key or DEFAULT_GROUP).upper()
+            lines.append(f" • {tag} ({g_str}): <code>{reqs}</code> запр.")
 
     if top_actions:
         lines.append("\n🔥 <b>Популярные действия за сутки:</b>")
