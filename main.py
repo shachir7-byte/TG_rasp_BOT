@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
+import re
 import sys
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -9,13 +10,13 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramConflictError, TelegramNetworkError
 
 from config import BOT_TOKEN, ADMIN_ID, PROXY_URL
-from database import init_db, close_db_connection, get_all_users, get_user_settings
+from database import init_db, close_db_connection
 from utils.api_client import init_session, close_session
 from middlewares.throttling import ThrottlingMiddleware
 from handlers import admin, schedule, worker
 
 # =====================================================================
-# НАСТРОЙКА ЛОГИРОВАНИЯ (МГНОВЕННЫЙ СБРОС БУФЕРА ДЛЯ TAIL -F)
+# НАСТРОЙКА ЛОГИРОВАНИЯ И ЗАЩИТЫ ОТ СЕТЕВОГО СПАМА В ЛОГАХ
 # =====================================================================
 class InstantRotatingFileHandler(RotatingFileHandler):
     """
@@ -26,7 +27,26 @@ class InstantRotatingFileHandler(RotatingFileHandler):
         super().emit(record)
         self.flush()
 
-# Настраиваем корневой (ROOT) логгер, чтобы логи собирались со ВСЕХ файлов проекта
+class TelegramNetworkSpamFilter(logging.Filter):
+    """
+    Фильтр для логгера aiogram.dispatcher:
+    Если на ПК временно упал прокси/VPN, не дает забивать bot.log тысячами
+    одинаковых ошибок каждые 5 секунд. Логирует 1-ю попытку и далее каждую 50-ю.
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if "Failed to fetch updates" in msg:
+            # Скрываем дублирующиеся строки ERROR, так как следом всегда идет строка с номером попытки
+            return False
+        if "Sleep for" in msg and "tryings =" in msg:
+            match = re.search(r"tryings\s*=\s*(\d+)", msg)
+            if match:
+                tries = int(match.group(1))
+                # Записываем в лог только начало обрыва (0) и затем каждую 50-ю попытку
+                return tries == 0 or tries % 50 == 0
+        return True
+
+# Настраиваем корневой (ROOT) логгер для всех модулей проекта
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 
@@ -42,8 +62,11 @@ root_logger.handlers.clear()
 root_logger.addHandler(file_handler)
 root_logger.addHandler(console_handler)
 
-# Снижаем шум сетевой библиотеки aiogram, чтобы не засорять логи
-logging.getLogger("aiogram").setLevel(logging.WARNING)
+# Подключаем фильтр анти-спама к сетевому поллингу aiogram
+aiogram_logger = logging.getLogger("aiogram")
+aiogram_logger.setLevel(logging.WARNING)
+logging.getLogger("aiogram.dispatcher").addFilter(TelegramNetworkSpamFilter())
+
 logger = logging.getLogger(__name__)
 
 # =====================================================================
@@ -53,7 +76,7 @@ dp = Dispatcher()
 dp.include_router(admin.router)
 dp.include_router(schedule.router)
 
-# Защита от спама кнопками: аргумент строго delay=0.1
+# Защита от спама кнопками (0.1 сек между кликами)
 dp.callback_query.middleware(ThrottlingMiddleware(delay=0.1))
 dp.message.middleware(ThrottlingMiddleware(delay=0.1))
 
@@ -68,7 +91,7 @@ async def on_startup(bot: Bot):
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook сброшен, БД и сессии готовы")
 
-        # Оповещение администратора о старте без технических деталей о файлах логов
+        # Оповещение администратора о старте
         if ADMIN_ID:
             try:
                 await bot.send_message(
@@ -79,7 +102,7 @@ async def on_startup(bot: Bot):
             except Exception as e:
                 logger.warning(f"Не удалось отправить уведомление админу: {e}")
 
-        # Фоновый воркер напоминаний о занятиях
+        # Запуск фонового воркера напоминаний о занятиях
         if hasattr(worker, 'notification_worker'):
             asyncio.create_task(worker.notification_worker(bot))
             logger.info("Задача worker запущена")
@@ -107,12 +130,13 @@ dp.shutdown.register(on_shutdown)
 # ТОЧКА ВХОДА (MAIN)
 # =====================================================================
 async def main():
-    session = None
+    # Настраиваем укороченный таймаут сессии (25 сек), чтобы прокси не рвал соединение по 60с таймауту
     if PROXY_URL:
         logger.info(f"Используем прокси: {PROXY_URL}")
-        session = AiohttpSession(proxy=PROXY_URL)
+        session = AiohttpSession(proxy=PROXY_URL, timeout=25.0)
     else:
-        session = AiohttpSession()
+        logger.info("Работаем напрямую (без прокси)")
+        session = AiohttpSession(timeout=25.0)
 
     bot = Bot(
         token=BOT_TOKEN,
@@ -122,7 +146,12 @@ async def main():
 
     try:
         logger.info("Запуск polling...")
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        # polling_timeout=15 держит короткие циклы опроса, предотвращая зависание NAT/прокси
+        await dp.start_polling(
+            bot,
+            polling_timeout=15,
+            allowed_updates=dp.resolve_used_update_types()
+        )
     except KeyboardInterrupt:
         logger.info("Остановка по Ctrl+C")
     except TelegramConflictError:
@@ -132,8 +161,7 @@ async def main():
     except Exception as e:
         logger.critical(f"Критическая ошибка: {e}", exc_info=True)
     finally:
-        # ВАЖНО: Закрываем только локальную сессию aiohttp.
-        # Метод bot.close() НЕ вызываем, чтобы Telegram API не блокировал бота на 500+ секунд.
+        # Закрываем только локальную сессию aiohttp без вызова bot.close()
         try:
             if bot.session:
                 await bot.session.close()
