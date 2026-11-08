@@ -14,12 +14,25 @@ DAYS_FULL = [
     'ПЯТНИЦА', 'СУББОТА', 'ВОСКРЕСЕНЬЕ'
 ]
 
+# Опциональный словарь для полной расшифровки инициалов преподавателей.
+# Если API колледжа отдает сокращенно "Иванов И.И.", а ты хочешь видеть полное имя-отчество,
+# просто добавь их сюда по образцу ниже:
+TEACHER_FULL_NAMES = {
+    # "Иванов И.И.": "Иванов Иван Иванович",
+}
+
+def format_teacher_name(raw_teacher: str) -> str:
+    """Форматирует ФИО преподавателя и подставляет полное имя из словаря при наличии."""
+    cleaned = " ".join(raw_teacher.strip().split())
+    if not cleaned or cleaned.lower() in {"нет преп.", "нет", "-", "—"}:
+        return "Не указан"
+    return TEACHER_FULL_NAMES.get(cleaned, cleaned)
+
 def is_lesson_now(time_start: str, time_end: str, now: datetime) -> bool:
     if not time_start or not time_end:
         return False
     try:
         today_str = now.strftime("%Y-%m-%d")
-        # Синхронизируем tzinfo, чтобы не было ошибки naive/aware datetime
         start_dt = datetime.strptime(f"{today_str} {time_start}", "%Y-%m-%d %H:%M").replace(tzinfo=now.tzinfo)
         end_dt = datetime.strptime(f"{today_str} {time_end}", "%Y-%m-%d %H:%M").replace(tzinfo=now.tzinfo)
         return start_dt <= now <= end_dt
@@ -40,9 +53,10 @@ def _format_single_day(lessons: list, now: datetime, is_today: bool = False) -> 
         lines.append(f"{num_str} <b>{num}-я пара</b> ({time_slot}){active_marker}")
         lines.append(f"📖 <b>{l.get('subject', '—')}</b>")
         
-        teacher = l.get('teacher', '').strip()
-        if teacher:
-            lines.append(f"👤 Преп: <i>{teacher}</i>")
+        teacher_raw = l.get('teacher', '').strip()
+        if teacher_raw:
+            full_teacher = format_teacher_name(teacher_raw)
+            lines.append(f"👨‍🏫 Преподаватель: <i>{full_teacher}</i>")
             
         room = l.get('room', '').strip()
         if room:
