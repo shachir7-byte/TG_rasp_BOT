@@ -1,55 +1,88 @@
-from datetime import datetime, timedelta, timezone
-from config import LOCAL_TIMEZONE_OFFSET
+from __future__ import annotations
 
-LOCAL_TZ = timezone(timedelta(hours=LOCAL_TIMEZONE_OFFSET))
+from collections import defaultdict
+from datetime import datetime
+from html import escape
 
-def is_lesson_now(time_start: str, time_end: str, now: datetime) -> bool:
-    if not time_start or not time_end:
+from engines.base import Lesson
+
+DAY_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def _esc(value) -> str:
+    return escape(str(value if value is not None else ""))
+
+
+def _time(lesson: Lesson) -> str:
+    if lesson.time_start and lesson.time_end:
+        return f"{lesson.time_start}–{lesson.time_end}"
+    return lesson.time_start or lesson.time_end or ""
+
+
+def is_lesson_now(lesson: Lesson, now: datetime) -> bool:
+    if not lesson.time_start or not lesson.time_end:
         return False
     try:
-        today_str = now.strftime("%Y-%m-%d")
-        start_dt = datetime.strptime(f"{today_str} {time_start}", "%Y-%m-%d %H:%M")
-        end_dt = datetime.strptime(f"{today_str} {time_end}", "%Y-%m-%d %H:%M")
-        return start_dt <= now <= end_dt
-    except:
+        local_now = now.astimezone() if now.tzinfo else now
+        local_now = local_now.replace(tzinfo=None)
+        start = datetime.strptime(f"{local_now:%Y-%m-%d} {lesson.time_start}", "%Y-%m-%d %H:%M")
+        end = datetime.strptime(f"{local_now:%Y-%m-%d} {lesson.time_end}", "%Y-%m-%d %H:%M")
+    except ValueError:
         return False
+    return start <= local_now <= end
 
-def format_schedule_text(title: str, lessons: list, is_week: bool, now: datetime) -> str:
+
+def _lesson_block(lesson: Lesson, now: datetime) -> str:
+    marker = "📍 " if is_lesson_now(lesson, now) else ""
+    lines = [f"{marker}<b>{_time(lesson)}</b>", _esc(lesson.subject)]
+    if lesson.subgroup:
+        lines.append(f"<i>подгруппа {lesson.subgroup}</i>")
+    if lesson.teacher:
+        lines.append(f"<i>👤 {_esc(lesson.teacher)}</i>")
+    lines.append(f"🚪 Каб: <code>{_esc(lesson.room)}</code>")
+    return "\n".join(lines)
+
+
+def format_schedule(title: str, lessons: list[Lesson], is_week: bool, now: datetime) -> str:
     if not lessons:
-        return f"📅 <b>{title}</b>\n\n🟢 <i>Пар нет, отдыхай!</i>"
-    
-    lines = [f"📅 <b>{title}</b>\n", "━━━━━━━━━━━━━━━━━━━━━━"]
-    
+        return f"📅 <b>{_esc(title)}</b>\n\n🟢 <i>Пар нет, отдыхай!</i>"
+
+    lines = [f"📅 <b>{_esc(title)}</b>\n", "━━━━━━━━━━━━━━━━━━━━━━"]
+
     if is_week:
-        from collections import defaultdict
-        by_date = defaultdict(list)
-        for l in lessons:
-            by_date[l['date']].append(l)
-        
-        for date_str in sorted(by_date.keys()):
+        by_date: dict[str, list[Lesson]] = defaultdict(list)
+        for lesson in lessons:
+            by_date[lesson.date].append(lesson)
+        for date_str in sorted(by_date):
             try:
-                d_obj = datetime.strptime(date_str, "%Y-%m-%d")
-                day_name = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'][d_obj.weekday()]
-                lines.append(f"\n<b>🗓 {day_name} | {d_obj.strftime('%d.%m')}</b>")
-            except:
-                lines.append(f"\n<b>{date_str}</b>")
-            
-            lines.append("──────────────────────")
-            day_lessons = sorted(by_date[date_str], key=lambda x: x['lesson_number'])
-            
-            for l in day_lessons:
-                marker = "📍 " if is_lesson_now(l['time_start'], l['time_end'], now) else ""
-                lines.append(f"{marker}<b>{l['time']}</b>")
-                lines.append(f"{l['subject']}")
-                lines.append(f"<i>👤 {l['teacher']}</i>")
-                lines.append(f"🚪 Каб: <code>{l['room']}</code>")
+                day = datetime.strptime(date_str, "%Y-%m-%d")
+                header = f"🗓 {DAY_SHORT[day.weekday()]} | {day:%d.%m}"
+            except ValueError:
+                header = date_str
+            lines.append(f"\n<b>{header}</b>")
+            lines.append("──────────────────")
+            for lesson in sorted(by_date[date_str], key=lambda item: (item.slot, item.subgroup)):
+                lines.append(_lesson_block(lesson, now))
                 lines.append("")
     else:
-        for l in sorted(lessons, key=lambda x: x['lesson_number']):
-            marker = "📍 " if is_lesson_now(l['time_start'], l['time_end'], now) else ""
-            lines.append(f"\n{marker}<b>{l['time']}</b>")
-            lines.append(f"{l['subject']}")
-            lines.append(f"<i>👤 {l['teacher']}</i>")
-            lines.append(f"🚪 Каб: <code>{l['room']}</code>")
-            
-    return "\n".join(lines)
+        for lesson in sorted(lessons, key=lambda item: (item.slot, item.subgroup)):
+            lines.append(_lesson_block(lesson, now))
+            lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+def split_message(text: str, limit: int = 4000) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        if current and len(current) + len(block) + 2 > limit:
+            parts.append(current)
+            current = block
+        else:
+            current = f"{current}\n\n{block}" if current else block
+    if current:
+        parts.append(current)
+    return parts

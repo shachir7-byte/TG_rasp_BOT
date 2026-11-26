@@ -1,110 +1,133 @@
+from __future__ import annotations
+
 import asyncio
 import logging
+import os
 from logging.handlers import RotatingFileHandler
-from aiogram import Bot, Dispatcher, F
+
+from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramConflictError, TelegramNetworkError
-from config import BOT_TOKEN, ADMIN_ID
-from database import init_db, close_db_connection, get_all_users, get_user_settings
-from utils.api_client import init_session, close_session
+
+from config import ADMIN_IDS, BOT_TOKEN, DATA_DIR, LOG_FILE, PROXY_URL
+from database import close_db_connection, init_db
+from engines import close_session, health_check, init_session
+from handlers import admin, schedule, worker
 from middlewares.throttling import ThrottlingMiddleware
-from handlers import admin, schedule, worker # ВАЖНО: admin перед schedule
 
 logger = logging.getLogger(__name__)
+_worker_task: asyncio.Task | None = None
 
-file_handler = RotatingFileHandler("bot.log", maxBytes=5*1024*1024, backupCount=3, encoding='utf-8')
-file_handler.setLevel(logging.DEBUG)
-file_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-file_handler.setFormatter(file_formatter)
 
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.WARNING)
-console_formatter = logging.Formatter("✅ %(levelname)s: %(message)s")
-console_handler.setFormatter(console_formatter)
+def setup_logging() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-logger.setLevel(logging.DEBUG)
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
+    file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
 
-logging.getLogger("aiogram").setLevel(logging.WARNING) 
-logging.getLogger("aiogram").addHandler(file_handler)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+    logging.basicConfig(level=logging.DEBUG, handlers=[file_handler, console_handler])
+    logging.getLogger("aiogram").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp_retry").setLevel(logging.WARNING)
+
+
+setup_logging()
 
 dp = Dispatcher()
-# Порядок важен: admin первым, чтобы перехватывать состояния FSM
 dp.include_router(admin.router)
 dp.include_router(schedule.router)
 dp.update.middleware(ThrottlingMiddleware(delay=0.05))
 
-async def on_startup(bot: Bot):
-    logger.info("--- ЗАПУСК БОТА (PRO VERSION) ---")
+
+async def on_startup(bot: Bot) -> None:
+    global _worker_task
+    logger.info("Запуск бота")
+    await init_db()
+    await init_session()
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("БД и HTTP-сессия готовы")
+
+    # Health-check движков при старте
+    down: list[str] = []
     try:
-        await init_db()
-        await init_session()
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook сброшен, БД и сессии готовы")
-        
+        health = await health_check()
+        for key, ok in health.items():
+            if ok:
+                logger.info("Движок %s: OK", key)
+            else:
+                logger.warning("Движок %s: НЕДОСТУПЕН", key)
+                down.append(key)
+    except Exception as error:
+        logger.warning("Health-check при старте не удался: %s", error)
+
+    start_text = "🤖 <b>БОТ ЗАПУЩЕН</b>"
+    if down:
+        start_text += f"\n⚠️ Недоступны движки: {', '.join(down)}"
+
+    for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(ADMIN_ID, f"🤖 <b>БОТ ЗАПУЩЕН</b>\nЛоги пишутся в bot.log", parse_mode="HTML")
-        except Exception as e:
-            logger.warning(f"Не удалось уведомить админа: {e}")
-        
-        users = await get_all_users()
-        count = 0
-        for u in users:
-            chat_id = u[0]
-            if chat_id == ADMIN_ID: continue
-            try:
-                settings = await get_user_settings(chat_id)
-                if settings and len(settings) > 6 and settings[6] == 1:
-                    await bot.send_message(chat_id, "✅ <b>Бот обновлен</b>.", parse_mode="HTML")
-                    count += 1
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
-        
-        if count > 0:
-            logger.info(f"Restart notified to {count} users")
-        
-        asyncio.create_task(worker.notification_worker(bot))
-        logger.info("Worker task created")
-        
-    except Exception as e:
-        logger.critical(f"Ошибка при старте: {e}")
-        raise
+            await bot.send_message(admin_id, start_text, parse_mode="HTML")
+        except Exception as error:
+            logger.warning("Не удалось уведомить админа %s: %s", admin_id, error)
 
-async def on_shutdown(bot: Bot):
-    logger.info("--- ОСТАНОВКА БОТА ---")
-    try:
-        await close_session()
-        await close_db_connection()
-    except Exception as e:
-        logger.error(f"Ошибка закрытия сессий: {e}")
-    logger.info("Sessions closed gracefully")
+    _worker_task = asyncio.create_task(worker.notification_worker(bot))
+    logger.info("Фоновая задача уведомлений запущена")
 
-async def main():
-    session = AiohttpSession()
+
+async def on_shutdown(bot: Bot) -> None:
+    global _worker_task
+    logger.info("Остановка бота")
+    if _worker_task is not None:
+        _worker_task.cancel()
+        try:
+            await _worker_task
+        except asyncio.CancelledError:
+            pass
+        _worker_task = None
+    await close_session()
+    await close_db_connection()
+    logger.info("Сессии закрыты")
+
+
+dp.startup.register(on_startup)
+dp.shutdown.register(on_shutdown)
+
+
+async def main() -> None:
+    if PROXY_URL:
+        logger.info("Используем прокси")
+        session = AiohttpSession(proxy=PROXY_URL)
+    else:
+        session = AiohttpSession()
+
     bot = Bot(token=BOT_TOKEN, session=session)
-    
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-    
+
     try:
-        logger.info("Запуск polling...")
-        print("🚀 Бот запущен! (Логи в bot.log)")
+        logger.info("Запуск polling")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     except KeyboardInterrupt:
         logger.info("Остановка по Ctrl+C")
     except TelegramConflictError:
-        logger.error("❌ КОНФЛИКТ: Бот уже запущен!")
-    except TelegramNetworkError as e:
-        logger.error(f"❌ СЕТЬ: {e}")
-    except Exception as e:
-        logger.critical(f"Критическая ошибка: {e}")
+        logger.error("Конфликт: бот уже запущен")
+    except TelegramNetworkError as error:
+        logger.error("Сетевая ошибка: %s", error)
+    except Exception as error:
+        logger.critical("Критическая ошибка: %s", error)
     finally:
         try:
+            await bot.session.close()
             await bot.close()
-        except Exception as e:
-            logger.error(f"Ошибка при закрытии бота: {e}")
+        except Exception as error:
+            logger.error("Ошибка при закрытии бота: %s", error)
+
 
 if __name__ == "__main__":
     try:

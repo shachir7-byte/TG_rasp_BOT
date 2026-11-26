@@ -50,5 +50,11 @@ bot.log
 *.db-wal
 schedule.db
 
+# Runtime data
+data/
+
 # Backup files
 project_backup.txt
+.pytest_cache/
+.coverage
+*.bak

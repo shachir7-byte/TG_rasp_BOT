@@ -1,116 +1,90 @@
+from __future__ import annotations
+
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
-from collections import defaultdict
-from config import LOCAL_TIMEZONE_OFFSET
-from database import (
-    get_active_users_for_worker, update_last_sent, get_user_settings
-)
-from utils.api_client import get_schedule
-from utils.formatter import format_schedule_text
+from datetime import datetime
+
+from config import TIMEZONE
+from database import get_active_users_for_worker, update_last_sent
+from engines import fetch_group_schedule, week_monday
+from engines.base import Lesson
+from utils.formatter import format_schedule
 
 logger = logging.getLogger(__name__)
-TZ = timezone(timedelta(hours=LOCAL_TIMEZONE_OFFSET))
 
-async def notification_worker(bot):
-    logger.info("Worker started")
+
+def seconds_until_next_minute(now: datetime) -> float:
+    return max(1.0, 60.0 - now.second - now.microsecond / 1_000_000)
+
+
+def first_lesson_start(lessons: list[Lesson]) -> str | None:
+    starts = [lesson.time_start for lesson in lessons if lesson.time_start]
+    return min(starts) if starts else None
+
+
+def offset_notify_time(first_start: str | None, offset_hours: int) -> str | None:
+    if not first_start:
+        return None
+    try:
+        hours, minutes = map(int, first_start.split(":"))
+    except (AttributeError, ValueError):
+        return None
+    total = hours * 60 + minutes - offset_hours * 60
+    if total < 0:
+        return None
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+async def notification_worker(bot) -> None:
+    logger.info("Worker запущен")
     while True:
+        now = datetime.now(TIMEZONE)
         try:
-            now = datetime.now(TZ)
-            cur_time = now.strftime("%H:%M")
+            current_time = now.strftime("%H:%M")
             today_str = now.strftime("%Y-%m-%d")
-            
-            # Очистка статистики в 00:01
-            if cur_time == "00:01":
-                from database import clear_stats
-                try:
-                    await clear_stats()
-                    logger.info("Stats cleared")
-                except Exception as e:
-                    logger.error(f"Error clearing stats: {e}")
+            monday = week_monday(now.date())
 
-            # Получаем всех активных пользователей
             active_users = await get_active_users_for_worker()
-            if not active_users:
-                await asyncio.sleep(60)
-                continue
+            by_group: dict[str, list[dict]] = {}
+            for user in active_users:
+                if user["last_sent_date"] == today_str:
+                    continue
+                by_group.setdefault(user["user_group"], []).append(user)
 
-            # Группируем пользователей по группе, чтобы не дергать API лишний раз
-            # Структура active_users: (chat_id, n_time, n_type, n_off, last_sent, user_group)
-            groups_to_check = defaultdict(list)
-            for u in active_users:
-                chat_id, n_time, n_type, n_off, last_sent, user_group = u
-                groups_to_check[user_group].append(u)
-
-            for group_key, users in groups_to_check.items():
-                # Получаем расписание ОДИН РАЗ для всей группы
-                # force_refresh=False позволяет использовать кэш и MD5 проверку
+            for group, users in by_group.items():
+                if not users:
+                    continue
                 try:
-                    lessons, changes_detected = await get_schedule(group_key, today_str, force_refresh=False)
-                except Exception as e:
-                    logger.error(f"Failed to fetch schedule for {group_key}: {e}")
+                    lessons, _ = await fetch_group_schedule(group, monday)
+                except Exception as error:
+                    logger.error("Не удалось получить расписание %s: %s", group, error)
                     continue
 
-                # Если расписание изменилось (MD5 хэш не совпал), можно отправить уведомление об изменении
-                # (Опционально, сейчас просто логируем)
-                if changes_detected:
-                    logger.info(f"Changes detected for group {group_key}")
+                today_lessons = [lesson for lesson in lessons if lesson.date == today_str]
+                first_start = first_lesson_start(today_lessons)
 
                 for user in users:
-                    chat_id, n_time, n_type, n_off, last_sent, _ = user
-                    
-                    # Пропускаем, если уже отправляли сегодня
-                    if last_sent == today_str:
+                    should_send = False
+                    if user["notify_type"] == "time" and user["notify_time"] == current_time:
+                        should_send = True
+                    elif user["notify_type"] == "offset" and user["notify_offset"] > 0:
+                        target = offset_notify_time(first_start, user["notify_offset"])
+                        should_send = target == current_time
+
+                    if not should_send:
                         continue
 
-                    should_send = False
+                    try:
+                        title = f"Расписание на {now:%d.%m}"
+                        text = format_schedule(title, today_lessons, is_week=False, now=now)
+                        await bot.send_message(user["chat_id"], text, parse_mode="HTML")
+                        await update_last_sent(user["chat_id"], today_str)
+                        logger.info("Уведомление отправлено %s (%s)", user["chat_id"], group)
+                    except Exception as error:
+                        logger.error("Ошибка отправки уведомления %s: %s", user["chat_id"], error)
 
-                    # 1. Логика: По времени (например, в 08:00)
-                    if n_type == 'time' and n_time == cur_time:
-                        should_send = True
-
-                    # 2. Логика: За время до пары (Offset)
-                    elif n_type == 'offset' and n_off > 0 and lessons:
-                        # Ищем первую пару сегодня
-                        valid_lessons = [l for l in lessons if l.get('time_start')]
-                        if valid_lessons:
-                            first_lesson = min(valid_lessons, key=lambda x: x['time_start'])
-                            try:
-                                h, m = map(int, first_lesson['time_start'].split(':'))
-                                lesson_minutes = h * 60 + m
-                                notify_minutes = lesson_minutes - (n_off * 60)
-                                
-                                if notify_minutes >= 0:
-                                    nh, nm = divmod(notify_minutes, 60)
-                                    target_time_str = f"{nh:02d}:{nm:02d}"
-                                    if cur_time == target_time_str:
-                                        should_send = True
-                            except Exception as e:
-                                logger.error(f"Error calculating offset time: {e}")
-
-                    # Отправка уведомления
-                    if should_send:
-                        try:
-                            title = f"🔔 Расписание на {now.strftime('%d.%m')}"
-                            text = format_schedule_text(title, lessons, is_week=False, now=now)
-                            
-                            await bot.send_message(chat_id, text, parse_mode="HTML")
-                            await update_last_sent(chat_id, today_str)
-                            logger.info(f"Notification sent to {chat_id} ({group_key})")
-                            
-                            # Если были изменения в расписании, можно добавить второе сообщение
-                            if changes_detected:
-                                await bot.send_message(
-                                    chat_id, 
-                                    "⚠️ <b>Внимание!</b> В расписании произошли изменения.", 
-                                    parse_mode="HTML"
-                                )
-                        except Exception as e:
-                            logger.error(f"Error sending notification to {chat_id}: {e}")
-
-        except Exception as e:
-            logger.error(f"Worker loop critical error: {e}")
+        except Exception as error:
+            logger.error("Критическая ошибка worker: %s", error)
             await asyncio.sleep(10)
-        
-        # Проверка каждую минуту
-        await asyncio.sleep(60)
+
+        await asyncio.sleep(seconds_until_next_minute(datetime.now(TIMEZONE)))
